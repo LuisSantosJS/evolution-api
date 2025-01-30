@@ -11,6 +11,7 @@ generator client {
 datasource db {
   provider = "mysql"
   url      = env("DATABASE_CONNECTION_URI")
+  directUrl = env("DATABASE_DIRECT_CONNECTION_URI")
 }
 
 enum InstanceConnectionStatus {
