@@ -1,7 +1,7 @@
 import { ConfigService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { PrismaClient } from '@prisma/client';
-
+import { readReplicas } from '@prisma/extension-read-replicas';
 export class Query<T> {
   where?: T;
   sort?: 'asc' | 'desc';
@@ -17,6 +17,7 @@ export class PrismaRepository extends PrismaClient {
   private readonly logger = new Logger('PrismaRepository');
 
   public async onModuleInit() {
+    this.$extends(readReplicas({ url: process.env.DATABASE_URL_READ_REPLICA }));
     await this.$connect();
     this.logger.info('Repository:Prisma - ON');
   }
