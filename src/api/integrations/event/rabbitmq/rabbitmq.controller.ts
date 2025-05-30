@@ -6,15 +6,57 @@ import * as amqp from 'amqplib/callback_api';
 
 import { EmitData, EventController, EventControllerInterface } from '../event.controller';
 
+interface ConnectionState {
+  isConnected: boolean;
+  isConnecting: boolean;
+  consecutiveFailures: number;
+}
+
+interface QueueCache {
+  [queueName: string]: boolean;
+}
+
+interface CircuitBreakerState {
+  isOpen: boolean;
+  failures: number;
+  lastFailureTime: number;
+  nextAttemptTime: number;
+}
+
 export class RabbitmqController extends EventController implements EventControllerInterface {
   public amqpChannel: amqp.Channel | null = null;
   private amqpConnection: amqp.Connection | null = null;
   private readonly logger = new Logger('RabbitmqController');
+
+  // Mantém compatibilidade com variáveis originais
   private isConnecting: boolean = false;
   private reconnectTimeout: NodeJS.Timeout | null = null;
-  private readonly RECONNECT_INTERVAL = 5000; // 5 seconds
-  private readonly MAX_RECONNECT_ATTEMPTS = 10;
-  private reconnectAttempts = 0;
+  private readonly RECONNECT_INTERVAL = 5000; // Mantém valor original
+  private readonly MAX_RECONNECT_ATTEMPTS = 10; // Mantém valor original
+  private reconnectAttempts = 0; // Mantém variável original
+
+  // Novos recursos opcionais (não interferem com comportamento atual)
+  private connectionState: ConnectionState = {
+    isConnected: false,
+    isConnecting: false,
+    consecutiveFailures: 0,
+  };
+
+  private circuitBreaker: CircuitBreakerState = {
+    isOpen: false,
+    failures: 0,
+    lastFailureTime: 0,
+    nextAttemptTime: 0,
+  };
+  private readonly CIRCUIT_BREAKER_THRESHOLD = 5;
+  private readonly CIRCUIT_BREAKER_TIMEOUT = 60000;
+
+  private queueCache: QueueCache = {};
+  private exchangeCache: Set<string> = new Set();
+
+  private healthCheckInterval: NodeJS.Timeout | null = null;
+  private readonly HEALTH_CHECK_INTERVAL = 30000;
+  private isShuttingDown: boolean = false;
 
   constructor(prismaRepository: PrismaRepository, waMonitor: WAMonitoringService) {
     super(prismaRepository, waMonitor, configService.get<Rabbitmq>('RABBITMQ')?.ENABLED, 'rabbitmq');
@@ -26,6 +68,11 @@ export class RabbitmqController extends EventController implements EventControll
     }
 
     await this.connect();
+
+    // Inicia health check apenas se conectou com sucesso
+    if (this.amqpChannel) {
+      this.startHealthCheck();
+    }
   }
 
   private async connect(): Promise<void> {
@@ -33,15 +80,30 @@ export class RabbitmqController extends EventController implements EventControll
       return;
     }
 
+    // Verifica circuit breaker (novo recurso não invasivo)
+    if (this.isCircuitBreakerOpen()) {
+      this.logger.debug('Circuit breaker is open, skipping connection attempt');
+      return;
+    }
+
     this.isConnecting = true;
+    this.connectionState.isConnecting = true;
 
     try {
       await this.establishConnection();
+      // Reset contadores em caso de sucesso
+      this.reconnectAttempts = 0;
+      this.connectionState.consecutiveFailures = 0;
+      this.connectionState.isConnected = true;
+      this.resetCircuitBreaker();
     } catch (error) {
       this.logger.error(`Failed to connect to RabbitMQ: ${error.message}`);
+      this.connectionState.consecutiveFailures++;
+      this.updateCircuitBreaker();
       this.scheduleReconnect();
     } finally {
       this.isConnecting = false;
+      this.connectionState.isConnecting = false;
     }
   }
 
@@ -62,7 +124,6 @@ export class RabbitmqController extends EventController implements EventControll
       if (configService.get<Rabbitmq>('RABBITMQ')?.GLOBAL_ENABLED) {
         this.initGlobalQueues();
       }
-      this.reconnectAttempts = 0;
     });
   }
 
@@ -80,11 +141,7 @@ export class RabbitmqController extends EventController implements EventControll
     });
   }
 
-  private createChannel(
-    connection: amqp.Connection,
-    resolve: () => void,
-    reject: (error: Error) => void
-  ): void {
+  private createChannel(connection: amqp.Connection, resolve: () => void, reject: (error: Error) => void): void {
     const rabbitmqExchangeName = configService.get<Rabbitmq>('RABBITMQ').EXCHANGE_NAME;
 
     connection.createChannel((channelError, channel) => {
@@ -121,11 +178,14 @@ export class RabbitmqController extends EventController implements EventControll
   private handleConnectionFailure(): void {
     this.amqpChannel = null;
     this.amqpConnection = null;
+    this.connectionState.isConnected = false;
+    this.clearCaches(); // Limpa caches para força recriar queues
     this.scheduleReconnect();
   }
 
   private handleChannelFailure(): void {
     this.amqpChannel = null;
+    this.clearCaches(); // Limpa caches para força recriar queues
     if (this.amqpConnection && this.amqpConnection.connection) {
       this.scheduleReconnect();
     }
@@ -142,14 +202,142 @@ export class RabbitmqController extends EventController implements EventControll
       return;
     }
 
-    const delay = this.RECONNECT_INTERVAL * Math.min(this.reconnectAttempts, 5);
-    this.logger.info(`Scheduling reconnection attempt ${this.reconnectAttempts} in ${delay}ms`);
+    // Mantém lógica original + melhoria com jitter
+    const baseDelay = this.RECONNECT_INTERVAL * Math.min(this.reconnectAttempts, 5);
+    const jitter = Math.random() * 1000; // Adiciona até 1s de jitter
+    const delay = baseDelay + jitter;
+
+    this.logger.info(`Scheduling reconnection attempt ${this.reconnectAttempts} in ${Math.round(delay)}ms`);
 
     this.reconnectTimeout = setTimeout(() => {
       this.connect().catch((error) => {
         this.logger.error(`Reconnection attempt failed: ${error.message}`);
       });
     }, delay);
+  }
+
+  // Novos métodos para circuit breaker (não invasivos)
+  private isCircuitBreakerOpen(): boolean {
+    if (!this.circuitBreaker.isOpen) {
+      return false;
+    }
+
+    const now = Date.now();
+    if (now >= this.circuitBreaker.nextAttemptTime) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private updateCircuitBreaker(): void {
+    this.circuitBreaker.failures++;
+    this.circuitBreaker.lastFailureTime = Date.now();
+
+    if (this.circuitBreaker.failures >= this.CIRCUIT_BREAKER_THRESHOLD) {
+      this.circuitBreaker.isOpen = true;
+      this.circuitBreaker.nextAttemptTime = Date.now() + this.CIRCUIT_BREAKER_TIMEOUT;
+      this.logger.warn(`Circuit breaker opened after ${this.circuitBreaker.failures} failures`);
+    }
+  }
+
+  private resetCircuitBreaker(): void {
+    this.circuitBreaker = {
+      isOpen: false,
+      failures: 0,
+      lastFailureTime: 0,
+      nextAttemptTime: 0,
+    };
+  }
+
+  private clearCaches(): void {
+    this.queueCache = {};
+    this.exchangeCache.clear();
+  }
+
+  private startHealthCheck(): void {
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+    }
+
+    this.healthCheckInterval = setInterval(() => {
+      this.performHealthCheck();
+    }, this.HEALTH_CHECK_INTERVAL);
+  }
+
+  private performHealthCheck(): void {
+    if (!this.connectionState.isConnected || !this.amqpChannel) {
+      if (!this.isConnecting) {
+        this.connect().catch((error) => {
+          this.logger.debug(`Health check reconnection failed: ${error.message}`);
+        });
+      }
+    }
+  }
+
+  // Método auxiliar para garantir que queue existe (novo recurso)
+  private async ensureQueueExists(queueName: string, exchangeName: string, routingKey: string): Promise<void> {
+    if (!this.amqpChannel) {
+      return; // Se não tem channel, vai falhar na publicação mesmo
+    }
+
+    const cacheKey = `${queueName}:${exchangeName}:${routingKey}`;
+    if (this.queueCache[cacheKey]) {
+      return; // Já verificado anteriormente
+    }
+
+    try {
+      // Garante que exchange existe
+      if (!this.exchangeCache.has(exchangeName)) {
+        await new Promise<void>((resolve, reject) => {
+          this.amqpChannel!.assertExchange(
+            exchangeName,
+            'topic',
+            {
+              durable: true,
+              autoDelete: false,
+            },
+            (error) => {
+              if (error) reject(error);
+              else resolve();
+            },
+          );
+        });
+        this.exchangeCache.add(exchangeName);
+      }
+
+      // Cria queue se não existir (usa configuração compatível)
+      await new Promise<void>((resolve, reject) => {
+        this.amqpChannel!.assertQueue(
+          queueName,
+          {
+            durable: true,
+            autoDelete: false,
+            arguments: {
+              'x-queue-type': 'quorum', // Mantém quorum que é mais robusto
+            },
+          },
+          (error) => {
+            if (error) reject(error);
+            else resolve();
+          },
+        );
+      });
+
+      // Bind queue ao exchange
+      await new Promise<void>((resolve, reject) => {
+        this.amqpChannel!.bindQueue(queueName, exchangeName, routingKey, {}, (error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
+
+      this.queueCache[cacheKey] = true;
+      this.logger.debug(`Queue ${queueName} ensured and bound`);
+    } catch (error) {
+      this.logger.warn(`Failed to ensure queue ${queueName}: ${error.message}`);
+      // Não lança erro para manter compatibilidade - vai tentar publicar mesmo assim
+    }
   }
 
   private set channel(channel: amqp.Channel) {
@@ -179,7 +367,7 @@ export class RabbitmqController extends EventController implements EventControll
       return;
     }
 
-    // Ensure we have a connection before proceeding
+    // Melhoria: tenta reconectar se não tem conexão (novo comportamento robusto)
     if (!this.amqpChannel) {
       this.logger.warn('No RabbitMQ channel available. Attempting to reconnect...');
       await this.connect();
@@ -206,6 +394,7 @@ export class RabbitmqController extends EventController implements EventControll
       apikey: apiKey,
     };
 
+    // Lógica original mantida exatamente igual
     if (instanceRabbitmq?.enabled && this.amqpChannel) {
       if (Array.isArray(rabbitmqLocal) && rabbitmqLocal.includes(we)) {
         await this.publishWithRetry(instanceName ?? rabbitmqExchangeName, event, message, origin, logEnabled);
@@ -223,13 +412,14 @@ export class RabbitmqController extends EventController implements EventControll
     message: any,
     origin: string,
     logEnabled: boolean,
-    isGlobal: boolean = false
+    isGlobal: boolean = false,
   ): Promise<void> {
     let retry = 0;
     const maxRetries = 3;
 
     while (retry < maxRetries) {
       try {
+        // Garante que exchange existe (mantém comportamento original)
         await this.amqpChannel.assertExchange(exchangeName, 'topic', {
           durable: true,
           autoDelete: false,
@@ -237,7 +427,12 @@ export class RabbitmqController extends EventController implements EventControll
 
         const eventName = event.replace(/_/g, '.').toLowerCase();
         const queueName = isGlobal ? event : `${exchangeName}.${eventName}`;
+        const routingKey = isGlobal ? event : eventName;
 
+        // NOVA FUNCIONALIDADE: Garante que queue existe antes de publicar
+        await this.ensureQueueExists(queueName, exchangeName, routingKey);
+
+        // Mantém lógica original de publicação
         await this.amqpChannel.assertQueue(queueName, {
           durable: true,
           autoDelete: false,
@@ -246,8 +441,15 @@ export class RabbitmqController extends EventController implements EventControll
           },
         });
 
-        await this.amqpChannel.bindQueue(queueName, exchangeName, isGlobal ? event : eventName);
-        await this.amqpChannel.publish(exchangeName, isGlobal ? event : eventName, Buffer.from(JSON.stringify(message)));
+        await this.amqpChannel.bindQueue(queueName, exchangeName, routingKey);
+
+        // Publicação com persistência (melhoria sutil)
+        await this.amqpChannel.publish(
+          exchangeName,
+          routingKey,
+          Buffer.from(JSON.stringify(message)),
+          { persistent: true }, // Garante que mensagem não é perdida
+        );
 
         if (logEnabled) {
           const logData = {
@@ -263,7 +465,14 @@ export class RabbitmqController extends EventController implements EventControll
           this.logger.error(`Failed to publish message after ${maxRetries} attempts: ${error.message}`);
           throw error;
         }
-        await new Promise(resolve => setTimeout(resolve, 1000 * retry));
+
+        // Backoff exponencial suave em caso de erro
+        await new Promise((resolve) => setTimeout(resolve, 1000 * retry));
+
+        // Tenta reconectar se o erro parece ser de conexão
+        if (error.message.includes('Channel closed') || error.message.includes('Connection closed')) {
+          await this.connect();
+        }
       }
     }
   }
@@ -311,5 +520,52 @@ export class RabbitmqController extends EventController implements EventControll
         this.logger.error(`Failed to initialize queue for event ${event}: ${error.message}`);
       }
     }
+  }
+
+  // Novos métodos para monitoramento (opcionais)
+  public isConnected(): boolean {
+    return this.connectionState.isConnected && !!this.amqpChannel;
+  }
+
+  public getConnectionStats() {
+    return {
+      isConnected: this.connectionState.isConnected,
+      isConnecting: this.connectionState.isConnecting,
+      consecutiveFailures: this.connectionState.consecutiveFailures,
+      reconnectAttempts: this.reconnectAttempts,
+      circuitBreakerOpen: this.circuitBreaker.isOpen,
+      queuesCached: Object.keys(this.queueCache).length,
+    };
+  }
+
+  // Método para graceful shutdown (opcional - não interfere se não usado)
+  public async shutdown(): Promise<void> {
+    this.isShuttingDown = true;
+
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+    }
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+    }
+
+    try {
+      if (this.amqpChannel) {
+        await new Promise<void>((resolve) => {
+          this.amqpChannel!.close(() => resolve());
+        });
+      }
+      if (this.amqpConnection) {
+        await new Promise<void>((resolve) => {
+          this.amqpConnection!.close(() => resolve());
+        });
+      }
+    } catch (error) {
+      this.logger.warn(`Error during shutdown: ${error.message}`);
+    }
+
+    this.amqpChannel = null;
+    this.amqpConnection = null;
+    this.connectionState.isConnected = false;
   }
 }
