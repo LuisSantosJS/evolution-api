@@ -11,8 +11,8 @@ export class RabbitmqController extends EventController implements EventControll
   private amqpConnection: amqp.Connection | null = null;
   private readonly logger = new Logger('RabbitmqController');
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 10;
   private reconnectDelay = 5000; // 5 seconds
+  private maxReconnectDelay = 60000; // 60 seconds max delay
   private isReconnecting = false;
 
   constructor(prismaRepository: PrismaRepository, waMonitor: WAMonitoringService) {
@@ -141,13 +141,6 @@ export class RabbitmqController extends EventController implements EventControll
   }
 
   private scheduleReconnect(): void {
-    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      this.logger.error(
-        `Maximum reconnect attempts (${this.maxReconnectAttempts}) reached. Stopping reconnection attempts.`,
-      );
-      return;
-    }
-
     if (this.isReconnecting) {
       return; // Already scheduled
     }
@@ -155,17 +148,17 @@ export class RabbitmqController extends EventController implements EventControll
     this.isReconnecting = true;
     this.reconnectAttempts++;
 
-    const delay = this.reconnectDelay * Math.pow(2, Math.min(this.reconnectAttempts - 1, 5)); // Exponential backoff with max delay
-
-    this.logger.info(
-      `Scheduling RabbitMQ reconnection attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} in ${delay}ms`,
+    // Exponential backoff with maximum delay cap - no limit on attempts
+    const delay = Math.min(
+      this.reconnectDelay * Math.pow(2, Math.min(this.reconnectAttempts - 1, 6)),
+      this.maxReconnectDelay,
     );
+
+    this.logger.info(`Scheduling RabbitMQ reconnection attempt ${this.reconnectAttempts} in ${delay}ms`);
 
     setTimeout(async () => {
       try {
-        this.logger.info(
-          `Attempting to reconnect to RabbitMQ (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`,
-        );
+        this.logger.info(`Attempting to reconnect to RabbitMQ (attempt ${this.reconnectAttempts})`);
         await this.connect();
         this.logger.info('Successfully reconnected to RabbitMQ');
       } catch (error) {
@@ -175,7 +168,7 @@ export class RabbitmqController extends EventController implements EventControll
           error: error.message || error,
         });
         this.isReconnecting = false;
-        this.scheduleReconnect();
+        this.scheduleReconnect(); // Continue trying indefinitely
       }
     }, delay);
   }
@@ -192,7 +185,15 @@ export class RabbitmqController extends EventController implements EventControll
     if (!this.amqpChannel) {
       this.logger.warn('AMQP channel is not available, attempting to reconnect...');
       if (!this.isReconnecting) {
-        this.scheduleReconnect();
+        try {
+          // Try immediate reconnection first
+          await this.connect();
+          this.logger.info('Immediate reconnection successful');
+          return true;
+        } catch (error) {
+          this.logger.warn('Immediate reconnection failed, scheduling reconnection...');
+          this.scheduleReconnect();
+        }
       }
       return false;
     }
@@ -218,9 +219,10 @@ export class RabbitmqController extends EventController implements EventControll
       return;
     }
 
-    if (!(await this.ensureConnection())) {
-      this.logger.warn(`Failed to emit event ${event} for instance ${instanceName}: No AMQP connection`);
-      return;
+    // Store connection status but don't return early - try each section independently
+    const hasConnection = await this.ensureConnection();
+    if (!hasConnection) {
+      this.logger.warn(`No AMQP connection available for event ${event} for instance ${instanceName}`);
     }
 
     const instanceRabbitmq = await this.get(instanceName);
@@ -242,13 +244,18 @@ export class RabbitmqController extends EventController implements EventControll
       apikey: apiKey,
     };
 
-    if (instanceRabbitmq?.enabled && this.amqpChannel) {
-      if (Array.isArray(rabbitmqLocal) && rabbitmqLocal.includes(we)) {
+    // Try local RabbitMQ sending
+    if (instanceRabbitmq?.enabled && Array.isArray(rabbitmqLocal) && rabbitmqLocal.includes(we)) {
+      // Ensure connection before attempting local send
+      if (!this.amqpChannel && !(await this.ensureConnection())) {
+        this.logger.warn(`Cannot send local RabbitMQ message for ${instanceName}: No connection`);
+      } else {
         const exchangeName = instanceName ?? rabbitmqExchangeName;
 
         let retry = 0;
+        const maxRetries = 10;
 
-        while (retry < 3) {
+        while (retry < maxRetries) {
           try {
             await this.amqpChannel.assertExchange(exchangeName, 'topic', {
               durable: true,
@@ -284,11 +291,15 @@ export class RabbitmqController extends EventController implements EventControll
           } catch (error) {
             this.logger.error({
               local: 'RabbitmqController.emit',
-              message: `Error publishing local RabbitMQ message (attempt ${retry + 1}/3)`,
+              message: `Error publishing local RabbitMQ message (attempt ${retry + 1}/${maxRetries})`,
               error: error.message || error,
             });
             retry++;
-            if (retry >= 3) {
+
+            // Add small delay between retries
+            if (retry < maxRetries) {
+              await new Promise((resolve) => setTimeout(resolve, 1000 * retry));
+            } else {
               this.handleConnectionLoss();
             }
           }
@@ -296,53 +307,64 @@ export class RabbitmqController extends EventController implements EventControll
       }
     }
 
-    if (rabbitmqGlobal && rabbitmqEvents[we] && this.amqpChannel) {
-      const exchangeName = rabbitmqExchangeName;
+    // Try global RabbitMQ sending
+    if (rabbitmqGlobal && rabbitmqEvents[we]) {
+      // Ensure connection before attempting global send
+      if (!this.amqpChannel && !(await this.ensureConnection())) {
+        this.logger.warn(`Cannot send global RabbitMQ message for event ${event}: No connection`);
+      } else {
+        const exchangeName = rabbitmqExchangeName;
 
-      let retry = 0;
+        let retry = 0;
+        const maxRetries = 10;
 
-      while (retry < 3) {
-        try {
-          await this.amqpChannel.assertExchange(exchangeName, 'topic', {
-            durable: true,
-            autoDelete: false,
-          });
+        while (retry < maxRetries) {
+          try {
+            await this.amqpChannel.assertExchange(exchangeName, 'topic', {
+              durable: true,
+              autoDelete: false,
+            });
 
-          const queueName = prefixKey
-            ? `${prefixKey}.${event.replace(/_/g, '.').toLowerCase()}`
-            : event.replace(/_/g, '.').toLowerCase();
+            const queueName = prefixKey
+              ? `${prefixKey}.${event.replace(/_/g, '.').toLowerCase()}`
+              : event.replace(/_/g, '.').toLowerCase();
 
-          await this.amqpChannel.assertQueue(queueName, {
-            durable: true,
-            autoDelete: false,
-            arguments: {
-              'x-queue-type': 'quorum',
-            },
-          });
+            await this.amqpChannel.assertQueue(queueName, {
+              durable: true,
+              autoDelete: false,
+              arguments: {
+                'x-queue-type': 'quorum',
+              },
+            });
 
-          await this.amqpChannel.bindQueue(queueName, exchangeName, event);
+            await this.amqpChannel.bindQueue(queueName, exchangeName, event);
 
-          await this.amqpChannel.publish(exchangeName, event, Buffer.from(JSON.stringify(message)));
+            await this.amqpChannel.publish(exchangeName, event, Buffer.from(JSON.stringify(message)));
 
-          if (logEnabled) {
-            const logData = {
-              local: `${origin}.sendData-RabbitMQ-Global`,
-              ...message,
-            };
+            if (logEnabled) {
+              const logData = {
+                local: `${origin}.sendData-RabbitMQ-Global`,
+                ...message,
+              };
 
-            this.logger.log(logData);
-          }
+              this.logger.log(logData);
+            }
 
-          break;
-        } catch (error) {
-          this.logger.error({
-            local: 'RabbitmqController.emit',
-            message: `Error publishing global RabbitMQ message (attempt ${retry + 1}/3)`,
-            error: error.message || error,
-          });
-          retry++;
-          if (retry >= 3) {
-            this.handleConnectionLoss();
+            break;
+          } catch (error) {
+            this.logger.error({
+              local: 'RabbitmqController.emit',
+              message: `Error publishing global RabbitMQ message (attempt ${retry + 1}/${maxRetries})`,
+              error: error.message || error,
+            });
+            retry++;
+
+            // Add small delay between retries
+            if (retry < maxRetries) {
+              await new Promise((resolve) => setTimeout(resolve, 1000 * retry));
+            } else {
+              this.handleConnectionLoss();
+            }
           }
         }
       }
@@ -352,8 +374,25 @@ export class RabbitmqController extends EventController implements EventControll
   private async initGlobalQueues(): Promise<void> {
     this.logger.info('Initializing global queues');
 
-    if (!(await this.ensureConnection())) {
-      this.logger.error('Cannot initialize global queues: No AMQP connection');
+    // Try to ensure connection with multiple attempts
+    let connectionAttempts = 0;
+    const maxConnectionAttempts = 5;
+
+    while (connectionAttempts < maxConnectionAttempts) {
+      if (await this.ensureConnection()) {
+        break;
+      }
+      connectionAttempts++;
+      if (connectionAttempts < maxConnectionAttempts) {
+        this.logger.warn(
+          `Global queues connection attempt ${connectionAttempts}/${maxConnectionAttempts} failed, retrying...`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, 2000 * connectionAttempts));
+      }
+    }
+
+    if (connectionAttempts >= maxConnectionAttempts) {
+      this.logger.error('Cannot initialize global queues: No AMQP connection after multiple attempts');
       return;
     }
 

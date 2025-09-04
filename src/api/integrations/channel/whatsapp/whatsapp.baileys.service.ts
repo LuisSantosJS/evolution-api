@@ -1124,15 +1124,14 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          const messageKey = `${this.instance.id}_${received.key.id}`;
-          const cached = await this.baileysCache.get(messageKey);
-
-          if (cached && !editedMessage) {
-            this.logger.info(`Message duplicated ignored: ${received.key.id}`);
-            continue;
-          }
-
-          await this.baileysCache.set(messageKey, true, 5 * 60);
+          // Removed duplicate message check - allowing all messages to be processed
+          // const messageKey = `${this.instance.id}_${received.key.id}`;
+          // const cached = await this.baileysCache.get(messageKey);
+          // if (cached && !editedMessage) {
+          //   this.logger.info(`Message duplicated ignored: ${received.key.id}`);
+          //   continue;
+          // }
+          // await this.baileysCache.set(messageKey, true, 5 * 60);
 
           if (
             (type !== 'notify' && type !== 'append') ||
@@ -1230,30 +1229,31 @@ export class BaileysStartupService extends ChannelStartupService {
 
             const { remoteJid } = received.key;
             const timestamp = msg.messageTimestamp;
-            const fromMe = received.key.fromMe.toString();
-            const messageKey = `${remoteJid}_${timestamp}_${fromMe}`;
 
-            const cachedTimestamp = await this.baileysCache.get(messageKey);
+            // Removed duplicate read message check - allowing all read messages to be processed
+            // const fromMe = received.key.fromMe.toString();
+            // const messageKey = `${remoteJid}_${timestamp}_${fromMe}`;
+            // const cachedTimestamp = await this.baileysCache.get(messageKey);
 
-            if (!cachedTimestamp) {
-              if (!received.key.fromMe) {
-                if (msg.status === status[3]) {
-                  this.logger.log(`Update not read messages ${remoteJid}`);
-                  await this.updateChatUnreadMessages(remoteJid);
-                } else if (msg.status === status[4]) {
-                  this.logger.log(`Update readed messages ${remoteJid} - ${timestamp}`);
-                  await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
-                }
-              } else {
-                // is send message by me
+            // if (!cachedTimestamp) {
+            if (!received.key.fromMe) {
+              if (msg.status === status[3]) {
+                this.logger.log(`Update not read messages ${remoteJid}`);
+                await this.updateChatUnreadMessages(remoteJid);
+              } else if (msg.status === status[4]) {
                 this.logger.log(`Update readed messages ${remoteJid} - ${timestamp}`);
                 await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
               }
-
-              await this.baileysCache.set(messageKey, true, 5 * 60);
             } else {
-              this.logger.info(`Update readed messages duplicated ignored [avoid deadlock]: ${messageKey}`);
+              // is send message by me
+              this.logger.log(`Update readed messages ${remoteJid} - ${timestamp}`);
+              await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
             }
+
+            // await this.baileysCache.set(messageKey, true, 5 * 60);
+            // } else {
+            //   this.logger.info(`Update readed messages duplicated ignored [avoid deadlock]: ${messageKey}`);
+            // }
 
             if (isMedia) {
               if (this.configService.get<S3>('S3').ENABLE) {
@@ -1411,16 +1411,14 @@ export class BaileysStartupService extends ChannelStartupService {
           key.remoteJid = key.senderPn;
         }
 
-        const updateKey = `${this.instance.id}_${key.id}_${update.status}`;
-
-        const cached = await this.baileysCache.get(updateKey);
-
-        if (cached) {
-          this.logger.info(`Message duplicated ignored [avoid deadlock]: ${updateKey}`);
-          continue;
-        }
-
-        await this.baileysCache.set(updateKey, true, 30 * 60);
+        // Removed duplicate update check - allowing all updates to be processed
+        // const updateKey = `${this.instance.id}_${key.id}_${update.status}`;
+        // const cached = await this.baileysCache.get(updateKey);
+        // if (cached) {
+        //   this.logger.info(`Message duplicated ignored [avoid deadlock]: ${updateKey}`);
+        //   continue;
+        // }
+        // await this.baileysCache.set(updateKey, true, 30 * 60);
 
         if (status[update.status] === 'READ' && key.fromMe) {
           if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
@@ -1489,27 +1487,28 @@ export class BaileysStartupService extends ChannelStartupService {
 
               const { remoteJid } = key;
               const timestamp = findMessage.messageTimestamp;
-              const fromMe = key.fromMe.toString();
-              const messageKey = `${remoteJid}_${timestamp}_${fromMe}`;
 
-              const cachedTimestamp = await this.baileysCache.get(messageKey);
+              // Removed duplicate message update check - allowing all updates to be processed
+              // const fromMe = key.fromMe.toString();
+              // const messageKey = `${remoteJid}_${timestamp}_${fromMe}`;
+              // const cachedTimestamp = await this.baileysCache.get(messageKey);
 
-              if (!cachedTimestamp) {
-                if (status[update.status] === status[4]) {
-                  this.logger.log(`Update as read in message.update ${remoteJid} - ${timestamp}`);
-                  await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
-                  await this.baileysCache.set(messageKey, true, 5 * 60);
-                }
-
-                await this.prismaRepository.message.update({
-                  where: { id: findMessage.id },
-                  data: { status: status[update.status] },
-                });
-              } else {
-                this.logger.info(
-                  `Update readed messages duplicated ignored in message.update [avoid deadlock]: ${messageKey}`,
-                );
+              // if (!cachedTimestamp) {
+              if (status[update.status] === status[4]) {
+                this.logger.log(`Update as read in message.update ${remoteJid} - ${timestamp}`);
+                await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
+                // await this.baileysCache.set(messageKey, true, 5 * 60);
               }
+
+              await this.prismaRepository.message.update({
+                where: { id: findMessage.id },
+                data: { status: status[update.status] },
+              });
+              // } else {
+              //   this.logger.info(
+              //     `Update readed messages duplicated ignored in message.update [avoid deadlock]: ${messageKey}`,
+              //   );
+              // }
             }
           }
 
