@@ -1472,9 +1472,7 @@ export class BaileysStartupService extends ChannelStartupService {
                 await this.prismaRepository.messageUpdate.create({ 
                   data: {
                     ...message,
-                    Message: {
-                      connect: { id: message.messageId }
-                    }
+                    messageId: message.messageId
                   }
                 });
               }
@@ -1529,9 +1527,7 @@ export class BaileysStartupService extends ChannelStartupService {
               await this.prismaRepository.messageUpdate.create({ 
                 data: {
                   ...message,
-                  Message: {
-                    connect: { id: message.messageId }
-                  }
+                  messageId: message.messageId
                 }
               });
             }
