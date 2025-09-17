@@ -133,32 +133,84 @@ export class WebsocketController extends EventController implements EventControl
       apikey: apiKey,
     };
 
-    if (configService.get<Websocket>('WEBSOCKET')?.GLOBAL_EVENTS) {
-      this.socket.emit(event, message);
+    // Verificar se Socket.IO está conectado
+    if (!this.socket) {
+      this.logger.warn('Socket.IO not initialized, event not sent');
+      return;
+    }
 
-      if (logEnabled) {
-        this.logger.log({ local: `${origin}.sendData-WebsocketGlobal`, ...message });
+    // Emitir evento global se habilitado
+    if (configService.get<Websocket>('WEBSOCKET')?.GLOBAL_EVENTS) {
+      try {
+        this.socket.emit(event, message);
+
+        if (logEnabled) {
+          this.logger.log({ local: `${origin}.sendData-WebsocketGlobal`, ...message });
+        }
+      } catch (error) {
+        this.logger.error({
+          local: 'WebsocketController.emit',
+          message: 'Error emitting global WebSocket event',
+          error: error.message || error,
+          event
+        });
       }
     }
 
     try {
-      const instance = await this.get(instanceName);
+      // Usar retry como no RabbitMQ para resolver race conditions
+      const instance = await this.get(instanceName, 3);
+
+      // Log para debug - ajuda a identificar quando configuração não é encontrada
+      this.logger.debug({
+        local: 'WebsocketController.emit',
+        message: 'Instance WebSocket configuration check',
+        instanceName,
+        hasInstanceConfig: !!instance,
+        isEnabled: instance?.enabled,
+        events: instance?.events,
+        eventToSend: configEv,
+        shouldSendLocal: instance?.enabled && Array.isArray(instance?.events) && instance?.events.includes(configEv),
+        socketConnected: !!this.socket,
+        globalEventsEnabled: configService.get<Websocket>('WEBSOCKET')?.GLOBAL_EVENTS
+      });
 
       if (!instance?.enabled) {
         return;
       }
 
       if (Array.isArray(instance?.events) && instance?.events.includes(configEv)) {
-        this.socket.of(`/${instanceName}`).emit(event, message);
+        const namespace = this.socket.of(`/${instanceName}`);
+        
+        // Verificar se há clientes conectados
+        if (namespace.sockets.size > 0) {
+          try {
+            namespace.emit(event, message);
 
-        if (logEnabled) {
-          this.logger.log({ local: `${origin}.sendData-Websocket`, ...message });
+            if (logEnabled) {
+              this.logger.log({ local: `${origin}.sendData-Websocket`, ...message });
+            }
+          } catch (error) {
+            this.logger.error({
+              local: 'WebsocketController.emit',
+              message: 'Error emitting instance WebSocket event',
+              error: error.message || error,
+              instanceName,
+              event
+            });
+          }
+        } else {
+          this.logger.debug(`No clients connected to namespace /${instanceName} for event ${event}`);
         }
       }
     } catch (err) {
-      if (logEnabled) {
-        this.logger.log(err);
-      }
+      this.logger.error({
+        local: 'WebsocketController.emit',
+        message: 'Error in WebSocket emit process',
+        error: err.message || err,
+        instanceName,
+        event
+      });
     }
   }
 }

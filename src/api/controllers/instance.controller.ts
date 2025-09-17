@@ -87,6 +87,11 @@ export class InstanceController {
       // set events
       await eventManager.setInstance(instance.instanceName, instanceData);
 
+      // Aguardar um pouco para garantir que a configuração foi persistida no banco
+      // Isso resolve o race condition onde sendDataWebhook é chamado antes da
+      // configuração do RabbitMQ estar disponível para consulta
+      await new Promise(resolve => setTimeout(resolve, 100));
+
       instance.sendDataWebhook(Events.INSTANCE_CREATE, {
         instanceName: instanceData.instanceName,
         instanceId: instanceId,

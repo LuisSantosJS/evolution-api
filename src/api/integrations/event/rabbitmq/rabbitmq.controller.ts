@@ -14,6 +14,16 @@ export class RabbitmqController extends EventController implements EventControll
   private reconnectDelay = 5000; // 5 seconds
   private maxReconnectDelay = 60000; // 60 seconds max delay
   private isReconnecting = false;
+  private healthCheckInterval: NodeJS.Timeout | null = null;
+  
+  // Métricas de monitoramento
+  private publishMetrics = {
+    success: 0,
+    failed: 0,
+    reconnections: 0,
+    lastError: null as string | null,
+    lastSuccess: null as Date | null,
+  };
 
   constructor(prismaRepository: PrismaRepository, waMonitor: WAMonitoringService) {
     super(prismaRepository, waMonitor, configService.get<Rabbitmq>('RABBITMQ')?.ENABLED, 'rabbitmq');
@@ -42,7 +52,9 @@ export class RabbitmqController extends EventController implements EventControll
         password: url.password || 'guest',
         vhost: url.pathname.slice(1) || '/',
         frameMax: frameMax,
-        heartbeat: 30, // Add heartbeat of 30 seconds
+        heartbeat: 60, // Aumentar heartbeat para 60 segundos para melhor estabilidade
+        connectionTimeout: 30000, // 30 segundos timeout de conexão
+        handshakeTimeout: 10000, // 10 segundos timeout de handshake
       };
 
       amqp.connect(connectionOptions, (error: Error, connection: amqp.Connection) => {
@@ -109,7 +121,13 @@ export class RabbitmqController extends EventController implements EventControll
           this.reconnectAttempts = 0; // Reset reconnect attempts on successful connection
           this.isReconnecting = false;
 
-          this.logger.info('AMQP initialized successfully');
+          // Habilitar confirmações de publicação
+          channel.confirmSelect();
+
+          // Iniciar monitoramento de saúde da conexão
+          this.startHealthCheck();
+
+          this.logger.info('AMQP initialized successfully with confirmations enabled');
 
           resolve();
         });
@@ -135,6 +153,12 @@ export class RabbitmqController extends EventController implements EventControll
     if (this.isReconnecting) {
       return; // Already attempting to reconnect
     }
+
+    // Parar monitoramento de saúde
+    this.stopHealthCheck();
+    
+    // Incrementar métrica de reconexões
+    this.publishMetrics.reconnections++;
 
     this.cleanup();
     this.scheduleReconnect();
@@ -179,6 +203,155 @@ export class RabbitmqController extends EventController implements EventControll
 
   public get channel(): amqp.Channel {
     return this.amqpChannel;
+  }
+
+  // Método para iniciar monitoramento de saúde da conexão
+  private startHealthCheck(): void {
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+    }
+
+    this.healthCheckInterval = setInterval(async () => {
+      if (this.amqpChannel) {
+        try {
+          // Verificar se a conexão está funcionando
+          await this.amqpChannel.checkExchange('amq.default');
+        } catch (error) {
+          this.logger.warn({
+            local: 'RabbitmqController.healthCheck',
+            message: 'Connection health check failed, triggering reconnection',
+            error: error.message || error,
+          });
+          this.handleConnectionLoss();
+        }
+      }
+    }, 30000); // Check a cada 30 segundos
+  }
+
+  // Método para parar monitoramento de saúde
+  private stopHealthCheck(): void {
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
+    }
+  }
+
+  // Método para publicar com confirmação
+  private async publishWithConfirmation(
+    exchangeName: string,
+    routingKey: string,
+    message: Buffer,
+    options?: amqp.Options.Publish
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      if (!this.amqpChannel) {
+        reject(new Error('No channel available'));
+        return;
+      }
+
+      const timeout = setTimeout(() => {
+        reject(new Error('Publish confirmation timeout'));
+      }, 5000);
+
+      try {
+        const confirmed = this.amqpChannel.publish(
+          exchangeName,
+          routingKey,
+          message,
+          { persistent: true, ...options },
+          (error) => {
+            clearTimeout(timeout);
+            if (error) {
+              reject(error);
+            } else {
+              resolve();
+            }
+          }
+        );
+
+        if (!confirmed) {
+          clearTimeout(timeout);
+          reject(new Error('Channel buffer full'));
+        }
+      } catch (error) {
+        clearTimeout(timeout);
+        reject(error);
+      }
+    });
+  }
+
+  // Método para log de métricas de publicação
+  private logPublishMetrics(event: string, success: boolean, error?: Error): void {
+    if (success) {
+      this.publishMetrics.success++;
+      this.publishMetrics.lastSuccess = new Date();
+    } else {
+      this.publishMetrics.failed++;
+      this.publishMetrics.lastError = error?.message || 'Unknown error';
+    }
+
+    this.logger.debug({
+      local: 'RabbitmqController.publishMetrics',
+      message: 'Publish attempt result',
+      event,
+      success,
+      metrics: this.publishMetrics,
+      connectionStatus: !!this.amqpChannel
+    });
+  }
+
+  // Método melhorado para publicação com retry robusto
+  private async publishWithRetry(
+    exchangeName: string,
+    routingKey: string,
+    message: Buffer,
+    maxRetries = 15,
+    eventName = 'unknown'
+  ): Promise<void> {
+    let retry = 0;
+    
+    while (retry < maxRetries) {
+      try {
+        // Verificar conexão antes de cada tentativa
+        if (!this.amqpChannel) {
+          await this.ensureConnection();
+          if (!this.amqpChannel) {
+            throw new Error('No connection available');
+          }
+        }
+
+        // Tentar publicar com confirmação
+        await this.publishWithConfirmation(exchangeName, routingKey, message);
+        
+        // Sucesso - log e retornar
+        this.logPublishMetrics(eventName, true);
+        return;
+        
+      } catch (error) {
+        retry++;
+        this.logPublishMetrics(eventName, false, error as Error);
+        
+        this.logger.error({
+          local: 'RabbitmqController.publishWithRetry',
+          message: `Publish attempt ${retry}/${maxRetries} failed for event ${eventName}`,
+          error: error.message || error,
+        });
+
+        if (retry >= maxRetries) {
+          throw error;
+        }
+
+        // Delay exponencial com jitter
+        const delay = Math.min(1000 * Math.pow(2, retry - 1), 30000);
+        const jitter = Math.random() * 1000;
+        await new Promise(resolve => setTimeout(resolve, delay + jitter));
+
+        // Forçar reconexão em caso de erro de conexão
+        if (error.message.includes('connection') || error.message.includes('channel')) {
+          this.handleConnectionLoss();
+        }
+      }
+    }
   }
 
   private async ensureConnection(): Promise<boolean> {
@@ -232,6 +405,18 @@ export class RabbitmqController extends EventController implements EventControll
     const prefixKey = configService.get<Rabbitmq>('RABBITMQ').PREFIX_KEY;
     const rabbitmqExchangeName = configService.get<Rabbitmq>('RABBITMQ').EXCHANGE_NAME;
     const we = event.replace(/[.-]/gm, '_').toUpperCase();
+
+    // Log para debug - ajuda a identificar quando configuração não é encontrada
+    this.logger.debug({
+      local: 'RabbitmqController.emit',
+      message: 'Instance RabbitMQ configuration check',
+      instanceName,
+      hasInstanceConfig: !!instanceRabbitmq,
+      isEnabled: instanceRabbitmq?.enabled,
+      events: instanceRabbitmq?.events,
+      eventToSend: we,
+      shouldSendLocal: instanceRabbitmq?.enabled && Array.isArray(rabbitmqLocal) && rabbitmqLocal.includes(we)
+    });
     const logEnabled = configService.get<Log>('LOG').LEVEL.includes('WEBHOOKS');
 
     const message = {
@@ -276,7 +461,14 @@ export class RabbitmqController extends EventController implements EventControll
 
             await this.amqpChannel.bindQueue(queueName, exchangeName, eventName);
 
-            await this.amqpChannel.publish(exchangeName, event, Buffer.from(JSON.stringify(message)));
+            // Usar método melhorado com retry e confirmação
+            await this.publishWithRetry(
+              exchangeName,
+              event,
+              Buffer.from(JSON.stringify(message)),
+              15,
+              `${origin}.sendData-RabbitMQ`
+            );
 
             if (logEnabled) {
               const logData = {
@@ -339,7 +531,14 @@ export class RabbitmqController extends EventController implements EventControll
 
             await this.amqpChannel.bindQueue(queueName, exchangeName, event);
 
-            await this.amqpChannel.publish(exchangeName, event, Buffer.from(JSON.stringify(message)));
+            // Usar método melhorado com retry e confirmação
+            await this.publishWithRetry(
+              exchangeName,
+              event,
+              Buffer.from(JSON.stringify(message)),
+              15,
+              `${origin}.sendData-RabbitMQ-Global`
+            );
 
             if (logEnabled) {
               const logData = {
@@ -447,6 +646,9 @@ export class RabbitmqController extends EventController implements EventControll
 
   public async cleanup(): Promise<void> {
     try {
+      // Parar monitoramento de saúde
+      this.stopHealthCheck();
+
       if (this.amqpChannel) {
         await this.amqpChannel.close();
         this.amqpChannel = null;

@@ -101,7 +101,7 @@ export class EventController {
     });
   }
 
-  public async get(instanceName: string): Promise<wa.LocalEvent> {
+  public async get(instanceName: string, retries = 3): Promise<wa.LocalEvent> {
     if (!this.status) {
       return;
     }
@@ -110,17 +110,25 @@ export class EventController {
       return null;
     }
 
-    const data = await this.prisma[this.name].findUnique({
-      where: {
-        instanceId: this.monitor.waInstances[instanceName].instanceId,
-      },
-    });
+    // Tentar buscar a configuração com retry para resolver race conditions
+    for (let i = 0; i < retries; i++) {
+      const data = await this.prisma[this.name].findUnique({
+        where: {
+          instanceId: this.monitor.waInstances[instanceName].instanceId,
+        },
+      });
 
-    if (!data) {
-      return null;
+      if (data) {
+        return data;
+      }
+
+      // Aguardar antes de tentar novamente (delay progressivo)
+      if (i < retries - 1) {
+        await new Promise(resolve => setTimeout(resolve, 50 * (i + 1)));
+      }
     }
 
-    return data;
+    return null;
   }
 
   public static readonly events = [
