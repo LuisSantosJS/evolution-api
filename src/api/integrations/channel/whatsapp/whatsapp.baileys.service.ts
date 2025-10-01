@@ -662,6 +662,23 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
 
+    // Clean up old client before creating new one
+    if (this.client) {
+      try {
+        this.client.ws?.close();
+        this.client.end(new Error('Reconnecting - cleaning old client'));
+        // Destroy and recreate message processor to reset RxJS streams
+        this.messageProcessor.onDestroy();
+        this.messageProcessor = new BaileysMessageProcessor();
+        this.messageProcessor.mount({
+          onMessageReceive: this.messageHandle['messages.upsert'].bind(this),
+        });
+      } catch (error) {
+        this.logger.warn('Error cleaning up old client:');
+        this.logger.warn(error);
+      }
+    }
+
     this.client = makeWASocket(socketConfig);
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
@@ -1676,7 +1693,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (events['messaging-history.set']) {
           const payload = events['messaging-history.set'];
-          this.messageHandle['messaging-history.set'](payload);
+          // Process async to not block realtime events
+          this.messageHandle['messaging-history.set'](payload).catch((error) => {
+            this.logger.error('Error processing messaging-history.set:');
+            this.logger.error(error);
+          });
         }
 
         if (events['messages.upsert']) {
