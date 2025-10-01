@@ -344,12 +344,12 @@ export class InstanceController {
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) instance.clearCacheChatwoot();
         this.logger.info('restarting instance' + instanceName);
 
-        instance.client?.ws?.close();
-        instance.client?.end(new Error('restart'));
+        // Calls controller.connectToWhatsapp → instance.connectToWhatsapp (service) → createClient
+        // createClient will handle: close old client, reset messageProcessor, create new client
         return await this.connectToWhatsapp({ instanceName });
       } else if (state == 'connecting') {
-        instance.client?.ws?.close();
-        instance.client?.end(new Error('restart'));
+        // Calls controller.connectToWhatsapp → instance.connectToWhatsapp (service) → createClient
+        // createClient will handle: close old client, reset messageProcessor, create new client
         return await this.connectToWhatsapp({ instanceName });
       }
     } catch (error) {
