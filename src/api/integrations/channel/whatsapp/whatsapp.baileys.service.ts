@@ -277,7 +277,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // Only start if alwaysOnline is disabled
     if (!this.localSettings.alwaysOnline) {
-      // Mark as unavailable every 10 minutes to ensure notifications on phone
+      // Mark as unavailable every 1 minute to ensure notifications on phone
       this.presenceInterval = setInterval(async () => {
         try {
           if (this.client && this.stateConnection.state === 'open') {
@@ -288,7 +288,7 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.warn('Failed to update presence automatically:');
           this.logger.warn(error);
         }
-      }, 10 * 60 * 1000); // 10 minutes
+      }, 1 * 60 * 1000); // 1 minute
     }
   }
 
