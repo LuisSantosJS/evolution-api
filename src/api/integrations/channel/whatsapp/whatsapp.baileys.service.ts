@@ -237,8 +237,11 @@ export class BaileysStartupService extends ChannelStartupService {
   private authStateProvider: AuthStateProvider;
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
+  private readonly messageStubRetryCache: Map<string, WAMessage> = new Map();
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
+  private presenceInterval: NodeJS.Timeout | null = null;
+  private lastActivity: number = Date.now();
 
   public stateConnection: wa.StateConnection = { state: 'close' };
 
@@ -249,6 +252,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    this.stopPresenceManager();
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
@@ -258,6 +262,38 @@ export class BaileysStartupService extends ChannelStartupService {
     if (sessionExists) {
       await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
     }
+  }
+
+  private stopPresenceManager() {
+    if (this.presenceInterval) {
+      clearInterval(this.presenceInterval);
+      this.presenceInterval = null;
+    }
+  }
+
+  private startPresenceManager() {
+    // Stop any existing interval
+    this.stopPresenceManager();
+
+    // Only start if alwaysOnline is disabled
+    if (!this.localSettings.alwaysOnline) {
+      // Mark as unavailable every 10 minutes to ensure notifications on phone
+      this.presenceInterval = setInterval(async () => {
+        try {
+          if (this.client && this.stateConnection.state === 'open') {
+            await this.client.sendPresenceUpdate('unavailable');
+            this.logger.verbose('Auto-marked presence as unavailable to allow notifications');
+          }
+        } catch (error) {
+          this.logger.warn('Failed to update presence automatically:');
+          this.logger.warn(error);
+        }
+      }, 10 * 60 * 1000); // 10 minutes
+    }
+  }
+
+  private markActivity() {
+    this.lastActivity = Date.now();
   }
 
   public async getProfileName() {
@@ -475,10 +511,17 @@ export class BaileysStartupService extends ChannelStartupService {
         profilePictureUrl: this.instance.profilePictureUrl,
         ...this.stateConnection,
       });
+
+      // Start automatic presence manager
+      this.startPresenceManager();
     }
 
     if (connection === 'connecting') {
       this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+    }
+
+    if (connection === 'close') {
+      this.stopPresenceManager();
     }
   }
 
@@ -1064,11 +1107,27 @@ export class BaileysStartupService extends ChannelStartupService {
       settings: any,
     ) => {
       try {
+        // Mark activity when receiving messages
+        this.markActivity();
+
+        // Filter out history sync messages - only process 'notify' type
+        if (type !== 'notify' && type !== 'append') {
+          return;
+        }
+
         for (const received of messages) {
           if (received.key.remoteJid?.includes('@lid') && received.key.senderPn) {
             (received.key as { previousRemoteJid?: string | null }).previousRemoteJid = received.key.remoteJid;
             received.key.remoteJid = received.key.senderPn;
           }
+
+          // Handle messageStubType 2 (Message absent from node) - cache for retry
+          if ((received as any)?.messageStubType === 2 && received.key?.id) {
+            this.logger.warn(`Message with stubType 2 cached for retry: ${received.key.id}`);
+            this.messageStubRetryCache.set(received.key.id, received);
+            continue;
+          }
+
           if (
             received?.messageStubParameters?.some?.((param) =>
               [
@@ -1420,6 +1479,21 @@ export class BaileysStartupService extends ChannelStartupService {
       const readChatToUpdate: Record<string, true> = {}; // {remoteJid: true}
 
       for await (const { key, update } of args) {
+        // Check if this message was cached due to stubType 2 and retry it
+        if (key.id && this.messageStubRetryCache.has(key.id)) {
+          const cachedMessage = this.messageStubRetryCache.get(key.id);
+          this.messageStubRetryCache.delete(key.id);
+
+          this.logger.info(`Retrying cached message with stubType 2: ${key.id}`);
+
+          // Re-emit as messages.upsert to process normally
+          this.client.ev.emit('messages.upsert', {
+            messages: [{ ...cachedMessage, ...update } as WAMessage],
+            type: 'notify',
+          });
+          continue;
+        }
+
         if (settings?.groupsIgnore && key.remoteJid?.includes('@g.us')) {
           continue;
         }
@@ -4427,24 +4501,36 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async updateChatUnreadMessages(remoteJid: string): Promise<number> {
-    const [chat, unreadMessages] = await Promise.all([
-      this.prismaRepository.chat.findFirst({ where: { remoteJid } }),
-      this.prismaRepository.message.count({
-        where: {
-          AND: [
-            { key: { path: ['remoteJid'], equals: remoteJid } },
-            { key: { path: ['fromMe'], equals: false } },
-            { status: { equals: status[3] } },
-          ],
-        },
-      }),
-    ]);
+    try {
+      const [chat, unreadMessages] = await Promise.all([
+        this.prismaRepository.chat.findFirst({
+          where: {
+            remoteJid,
+            instanceId: this.instanceId
+          }
+        }),
+        this.prismaRepository.message.count({
+          where: {
+            AND: [
+              { instanceId: this.instanceId },
+              { key: { path: ['remoteJid'], equals: remoteJid } },
+              { key: { path: ['fromMe'], equals: false } },
+              { status: { equals: status[3] } },
+            ],
+          },
+        }),
+      ]);
 
-    if (chat && chat.unreadMessages !== unreadMessages) {
-      await this.prismaRepository.chat.update({ where: { id: chat.id }, data: { unreadMessages } });
+      if (chat && chat.unreadMessages !== unreadMessages) {
+        await this.prismaRepository.chat.update({ where: { id: chat.id }, data: { unreadMessages } });
+      }
+
+      return unreadMessages;
+    } catch (error) {
+      this.logger.error('Error updating chat unread messages:');
+      this.logger.error(error);
+      return 0;
     }
-
-    return unreadMessages;
   }
 
   private async addLabel(labelId: string, instanceId: string, chatId: string) {

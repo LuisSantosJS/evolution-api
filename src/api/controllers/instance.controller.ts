@@ -114,13 +114,17 @@ export class InstanceController {
         });
       }
 
+      // Default settings to ensure correct behavior for notifications and presence
+      // alwaysOnline: false - Allows status to change to offline, enabling phone notifications
+      // readMessages: false - Doesn't auto-read messages
+      // readStatus: false - Doesn't auto-read status/stories
       const settings: wa.LocalSettings = {
         rejectCall: instanceData.rejectCall === true,
         msgCall: instanceData.msgCall || '',
         groupsIgnore: instanceData.groupsIgnore === true,
-        alwaysOnline: instanceData.alwaysOnline === true,
-        readMessages: instanceData.readMessages === true,
-        readStatus: instanceData.readStatus === true,
+        alwaysOnline: instanceData.alwaysOnline === true, // Default: false
+        readMessages: instanceData.readMessages === true, // Default: false
+        readStatus: instanceData.readStatus === true, // Default: false
         syncFullHistory: instanceData.syncFullHistory === true,
         wavoipToken: instanceData.wavoipToken || '',
       };
