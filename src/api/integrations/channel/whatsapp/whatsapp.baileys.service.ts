@@ -238,6 +238,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private readonly messageStubRetryCache: Map<string, WAMessage> = new Map();
+  private readonly sessionErrorCache: Map<string, { count: number; lastError: number }> = new Map();
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private presenceInterval: NodeJS.Timeout | null = null;
@@ -1142,6 +1143,22 @@ export class BaileysStartupService extends ChannelStartupService {
             )
           ) {
             this.logger.warn(`Message ignored with messageStubParameters: ${JSON.stringify(received, null, 2)}`);
+
+            // Auto-handle session errors
+            const jid = received?.key?.remoteJid;
+            if (jid) {
+              const errorMsg = received.messageStubParameters?.join(', ') || 'Unknown session error';
+
+              // Check if it's a critical session error that should trigger auto-clear
+              const isCriticalError = received.messageStubParameters?.some?.((param) =>
+                ['Over 2000 messages', 'failed to decrypt message', 'SessionError'].some((err) => param?.includes?.(err)),
+              );
+
+              if (isCriticalError) {
+                await this.handleSessionError(jid, errorMsg);
+              }
+            }
+
             continue;
           }
           if (received.message?.conversation || received.message?.extendedTextMessage?.text) {
@@ -4653,6 +4670,85 @@ export class BaileysStartupService extends ChannelStartupService {
     const response = { me: this.client.authState.creds.me, account: this.client.authState.creds.account };
 
     return response;
+  }
+
+  private async handleSessionError(jid: string, errorMessage: string): Promise<void> {
+    const now = Date.now();
+    const cached = this.sessionErrorCache.get(jid);
+
+    // Reset counter if last error was more than 5 minutes ago
+    if (cached && now - cached.lastError > 300000) {
+      this.sessionErrorCache.delete(jid);
+    }
+
+    const errorCount = cached ? cached.count + 1 : 1;
+    this.sessionErrorCache.set(jid, { count: errorCount, lastError: now });
+
+    // Auto-clear threshold: 3 errors within 5 minutes
+    const threshold = 3;
+
+    if (errorCount >= threshold) {
+      this.logger.warn(
+        `Session error threshold (${threshold}) reached for ${jid}. Auto-clearing session. Error: ${errorMessage}`,
+      );
+
+      try {
+        await this.baileysClearSessions([jid]);
+        this.sessionErrorCache.delete(jid); // Reset counter after clearing
+        this.logger.info(`Successfully auto-cleared session for ${jid}`);
+      } catch (error) {
+        this.logger.error(`Failed to auto-clear session for ${jid}:`);
+        this.logger.error(error);
+      }
+    } else {
+      this.logger.warn(`Session error ${errorCount}/${threshold} for ${jid}: ${errorMessage}`);
+    }
+  }
+
+  public async baileysClearSessions(jids: string[]) {
+    if (!jids || !Array.isArray(jids) || jids.length === 0) {
+      throw new BadRequestException('JIDs array is required and must not be empty');
+    }
+
+    const clearedSessions = [];
+    const errors = [];
+
+    for (const jid of jids) {
+      try {
+        // Clear all session-related keys for this JID by setting them to undefined
+        const keysToRemove = {
+          session: { [jid]: undefined },
+          'sender-key': { [jid]: undefined },
+          'sender-key-memory': { [jid]: undefined },
+        };
+
+        // Use the auth state's keys.set method to remove the session data
+        await this.instance.authState.state.keys.set(keysToRemove);
+
+        this.logger.info(`Cleared session for ${jid}`);
+        clearedSessions.push(jid);
+      } catch (error) {
+        this.logger.error(`Failed to clear session for ${jid}:`);
+        this.logger.error(error);
+        errors.push({ jid, error: error.message });
+      }
+    }
+
+    // Force reassert sessions to establish new ones
+    try {
+      await this.client.assertSessions(jids, true);
+      this.logger.info(`Reasserted sessions for ${jids.length} contacts`);
+    } catch (error) {
+      this.logger.warn('Failed to reassert sessions:');
+      this.logger.warn(error);
+    }
+
+    return {
+      success: clearedSessions.length > 0,
+      clearedSessions,
+      errors: errors.length > 0 ? errors : undefined,
+      message: `Cleared ${clearedSessions.length} session(s). ${errors.length > 0 ? `Failed to clear ${errors.length} session(s).` : ''}`,
+    };
   }
 
   //Business Controller

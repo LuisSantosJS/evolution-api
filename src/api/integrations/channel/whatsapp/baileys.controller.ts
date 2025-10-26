@@ -57,4 +57,10 @@ export class BaileysController {
 
     return instance.baileysGetAuthState();
   }
+
+  public async clearSessions({ instanceName }: InstanceDto, body: any) {
+    const instance = this.waMonitor.waInstances[instanceName];
+
+    return instance.baileysClearSessions(body?.jids);
+  }
 }
