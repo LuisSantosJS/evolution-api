@@ -107,10 +107,12 @@ import makeWASocket, {
   getContentType,
   getDevice,
   GroupMetadata,
+  GroupParticipant,
   isJidBroadcast,
   isJidGroup,
   isJidNewsletter,
-  isJidUser,
+  isLidUser,
+  isPnUser,
   makeCacheableSignalKeyStore,
   MessageUpsertType,
   MessageUserReceiptUpdate,
@@ -1043,9 +1045,10 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
-          if (m.key.remoteJid?.includes('@lid') && m.key.senderPn) {
-            m.key.remoteJid = m.key.senderPn;
-          }
+          // LID handling is now done automatically by Baileys 7.0
+          // if (m.key.remoteJid?.includes('@lid')) {
+          //   // Use remoteJidAlt if needed
+          // }
 
           if (Long.isLong(m?.messageTimestamp)) {
             m.messageTimestamp = m.messageTimestamp?.toNumber();
@@ -1117,10 +1120,10 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         for (const received of messages) {
-          if (received.key.remoteJid?.includes('@lid') && received.key.senderPn) {
-            (received.key as { previousRemoteJid?: string | null }).previousRemoteJid = received.key.remoteJid;
-            received.key.remoteJid = received.key.senderPn;
-          }
+          // LID handling is now done automatically by Baileys 7.0
+          // if (received.key.remoteJid?.includes('@lid')) {
+          //   // Use remoteJidAlt if needed
+          // }
 
           // Handle messageStubType 2 (Message absent from node) - cache for retry
           if ((received as any)?.messageStubType === 2 && received.key?.id) {
@@ -1515,9 +1518,10 @@ export class BaileysStartupService extends ChannelStartupService {
           continue;
         }
 
-        if (key.remoteJid?.includes('@lid') && key.senderPn) {
-          key.remoteJid = key.senderPn;
-        }
+        // LID handling is now done automatically by Baileys 7.0
+        // if (key.remoteJid?.includes('@lid')) {
+        //   // Use remoteJidAlt if needed
+        // }
 
         // Removed duplicate update check - allowing all updates to be processed
         // const updateKey = `${this.instance.id}_${key.id}_${update.status}`;
@@ -1843,7 +1847,14 @@ export class BaileysStartupService extends ChannelStartupService {
 
           if (events['group-participants.update']) {
             const payload = events['group-participants.update'];
-            this.groupHandler['group-participants.update'](payload);
+            // Map GroupParticipant[] to string[] for compatibility
+            const mappedPayload = {
+              ...payload,
+              participants: payload.participants.map((p: GroupParticipant | string) =>
+                typeof p === 'string' ? p : p.id
+              ),
+            };
+            this.groupHandler['group-participants.update'](mappedPayload);
           }
         }
 
@@ -2037,7 +2048,7 @@ export class BaileysStartupService extends ChannelStartupService {
         quoted,
       });
       const id = await this.client.relayMessage(sender, message, { messageId });
-      m.key = { id: id, remoteJid: sender, participant: isJidUser(sender) ? sender : undefined, fromMe: true };
+      m.key = { id: id, remoteJid: sender, participant: (isPnUser(sender) || isLidUser(sender)) ? sender : undefined, fromMe: true };
       for (const [key, value] of Object.entries(m)) {
         if (!value || (isArray(value) && value.length) === 0) {
           delete m[key];
@@ -2209,7 +2220,7 @@ export class BaileysStartupService extends ChannelStartupService {
         const msg = m?.message ? m : ((await this.getMessage(m.key, true)) as proto.IWebMessageInfo);
 
         if (msg) {
-          quoted = msg;
+          quoted = msg as WAMessage;
         }
       }
 
@@ -3445,12 +3456,7 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           const numberJid = numberVerified?.jid || user.jid;
-          const lid =
-            typeof numberVerified?.lid === 'string'
-              ? numberVerified.lid
-              : numberJid.includes('@lid')
-                ? numberJid.split('@')[1]
-                : undefined;
+          const lid = numberJid.includes('@lid') ? numberJid.split('@')[0] : undefined;
           return new OnWhatsAppDto(
             numberJid,
             !!numberVerified?.exists,
@@ -3494,7 +3500,7 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       const keys: proto.IMessageKey[] = [];
       data.readMessages.forEach((read) => {
-        if (isJidGroup(read.remoteJid) || isJidUser(read.remoteJid)) {
+        if (isJidGroup(read.remoteJid) || isPnUser(read.remoteJid) || isLidUser(read.remoteJid)) {
           keys.push({ remoteJid: read.remoteJid, fromMe: read.fromMe, id: read.id });
         }
       });
@@ -4610,8 +4616,8 @@ export class BaileysStartupService extends ChannelStartupService {
     return response;
   }
 
-  public async baileysAssertSessions(jids: string[], force: boolean) {
-    const response = await this.client.assertSessions(jids, force);
+  public async baileysAssertSessions(jids: string[]) {
+    const response = await this.client.assertSessions(jids);
 
     return response;
   }
@@ -4736,7 +4742,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // Force reassert sessions to establish new ones
     try {
-      await this.client.assertSessions(jids, true);
+      await this.client.assertSessions(jids);
       this.logger.info(`Reasserted sessions for ${jids.length} contacts`);
     } catch (error) {
       this.logger.warn('Failed to reassert sessions:');
