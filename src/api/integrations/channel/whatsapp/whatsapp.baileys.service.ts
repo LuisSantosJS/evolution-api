@@ -2583,146 +2583,211 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async prepareMediaMessage(mediaMessage: MediaMessage) {
-    try {
-      const type = mediaMessage.mediatype === 'ptv' ? 'video' : mediaMessage.mediatype;
+    const maxRetries = 3;
+    const retryDelayMs = 1000;
+    let lastError: any;
 
-      let mediaInput: any;
-      if (mediaMessage.mediatype === 'image') {
-        let imageBuffer: Buffer;
-        if (isURL(mediaMessage.media)) {
-          let config: any = { responseType: 'arraybuffer' };
+    // Log inicial
+    this.logger.verbose(
+      `Preparing media message - Type: ${mediaMessage.mediatype}, Connection state: ${this.stateConnection.state}`,
+    );
 
-          if (this.localProxy?.enabled) {
-            config = {
-              ...config,
-              httpsAgent: makeProxyAgent({
-                host: this.localProxy.host,
-                port: this.localProxy.port,
-                protocol: this.localProxy.protocol,
-                username: this.localProxy.username,
-                password: this.localProxy.password,
-              }),
-            };
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        // Verificar estado da conexão antes de tentar upload
+        if (this.stateConnection.state !== 'open') {
+          this.logger.warn(
+            `Connection not open (state: ${this.stateConnection.state}), attempt ${attempt}/${maxRetries}`,
+          );
+
+          if (attempt < maxRetries) {
+            await delay(retryDelayMs * attempt); // Backoff exponencial
+            continue;
           }
 
-          const response = await axios.get(mediaMessage.media, config);
-          imageBuffer = Buffer.from(response.data, 'binary');
-        } else {
-          imageBuffer = Buffer.from(mediaMessage.media, 'base64');
+          throw new BadRequestException(
+            `Instance is not connected to WhatsApp. Current state: ${this.stateConnection.state}. Please wait for connection to be established.`,
+          );
         }
 
-        mediaInput = await sharp(imageBuffer).jpeg().toBuffer();
-        mediaMessage.fileName ??= 'image.jpg';
-        mediaMessage.mimetype = 'image/jpeg';
-      } else {
-        mediaInput = isURL(mediaMessage.media)
-          ? { url: mediaMessage.media }
-          : Buffer.from(mediaMessage.media, 'base64');
-      }
+        const type = mediaMessage.mediatype === 'ptv' ? 'video' : mediaMessage.mediatype;
 
-      const prepareMedia = await prepareWAMessageMedia(
-        {
-          [type]: mediaInput,
-        } as any,
-        { upload: this.client.waUploadToServer },
-      );
-
-      const mediaType = mediaMessage.mediatype + 'Message';
-
-      if (mediaMessage.mediatype === 'document' && !mediaMessage.fileName) {
-        const regex = new RegExp(/.*\/(.+?)\./);
-        const arrayMatch = regex.exec(mediaMessage.media);
-        mediaMessage.fileName = arrayMatch[1];
-      }
-
-      if (mediaMessage.mediatype === 'image' && !mediaMessage.fileName) {
-        mediaMessage.fileName = 'image.jpg';
-      }
-
-      if (mediaMessage.mediatype === 'video' && !mediaMessage.fileName) {
-        mediaMessage.fileName = 'video.mp4';
-      }
-
-      let mimetype: string | false;
-
-      if (mediaMessage.mimetype) {
-        mimetype = mediaMessage.mimetype;
-      } else {
-        mimetype = mimeTypes.lookup(mediaMessage.fileName);
-
-        if (!mimetype && isURL(mediaMessage.media)) {
-          let config: any = { responseType: 'arraybuffer' };
-
-          if (this.localProxy?.enabled) {
-            config = {
-              ...config,
-              httpsAgent: makeProxyAgent({
-                host: this.localProxy.host,
-                port: this.localProxy.port,
-                protocol: this.localProxy.protocol,
-                username: this.localProxy.username,
-                password: this.localProxy.password,
-              }),
-            };
-          }
-
-          const response = await axios.get(mediaMessage.media, config);
-
-          mimetype = response.headers['content-type'];
-        }
-      }
-
-      if (mediaMessage.mediatype === 'ptv') {
-        prepareMedia[mediaType] = prepareMedia[type + 'Message'];
-        mimetype = 'video/mp4';
-
-        if (!prepareMedia[mediaType]) {
-          throw new Error('Failed to prepare video message');
-        }
-
-        try {
-          let mediaInput;
+        let mediaInput: any;
+        if (mediaMessage.mediatype === 'image') {
+          let imageBuffer: Buffer;
           if (isURL(mediaMessage.media)) {
-            mediaInput = mediaMessage.media;
-          } else {
-            const mediaBuffer = Buffer.from(mediaMessage.media, 'base64');
-            if (!mediaBuffer || mediaBuffer.length === 0) {
-              throw new Error('Invalid media buffer');
+            let config: any = { responseType: 'arraybuffer' };
+
+            if (this.localProxy?.enabled) {
+              config = {
+                ...config,
+                httpsAgent: makeProxyAgent({
+                  host: this.localProxy.host,
+                  port: this.localProxy.port,
+                  protocol: this.localProxy.protocol,
+                  username: this.localProxy.username,
+                  password: this.localProxy.password,
+                }),
+              };
             }
-            mediaInput = mediaBuffer;
+
+            const response = await axios.get(mediaMessage.media, config);
+            imageBuffer = Buffer.from(response.data, 'binary');
+          } else {
+            imageBuffer = Buffer.from(mediaMessage.media, 'base64');
           }
 
-          const duration = await getVideoDuration(mediaInput);
-          if (!duration || duration <= 0) {
-            throw new Error('Invalid media duration');
-          }
-
-          this.logger.verbose(`Video duration: ${duration} seconds`);
-          prepareMedia[mediaType].seconds = duration;
-        } catch (error) {
-          this.logger.error('Error getting video duration:');
-          this.logger.error(error);
-          throw new Error(`Failed to get video duration: ${error.message}`);
+          mediaInput = await sharp(imageBuffer).jpeg().toBuffer();
+          mediaMessage.fileName ??= 'image.jpg';
+          mediaMessage.mimetype = 'image/jpeg';
+        } else {
+          mediaInput = isURL(mediaMessage.media)
+            ? { url: mediaMessage.media }
+            : Buffer.from(mediaMessage.media, 'base64');
         }
+
+        // Log tamanho da mídia
+        const mediaSize = Buffer.isBuffer(mediaInput) ? mediaInput.length : 'URL';
+        this.logger.verbose(`Media size: ${mediaSize}, attempting upload (${attempt}/${maxRetries})`);
+
+        const prepareMedia = await prepareWAMessageMedia(
+          {
+            [type]: mediaInput,
+          } as any,
+          { upload: this.client.waUploadToServer },
+        );
+
+        this.logger.verbose(`Media upload successful on attempt ${attempt}/${maxRetries}`);
+
+        const mediaType = mediaMessage.mediatype + 'Message';
+
+        if (mediaMessage.mediatype === 'document' && !mediaMessage.fileName) {
+          const regex = new RegExp(/.*\/(.+?)\./);
+          const arrayMatch = regex.exec(mediaMessage.media);
+          mediaMessage.fileName = arrayMatch[1];
+        }
+
+        if (mediaMessage.mediatype === 'image' && !mediaMessage.fileName) {
+          mediaMessage.fileName = 'image.jpg';
+        }
+
+        if (mediaMessage.mediatype === 'video' && !mediaMessage.fileName) {
+          mediaMessage.fileName = 'video.mp4';
+        }
+
+        let mimetype: string | false;
+
+        if (mediaMessage.mimetype) {
+          mimetype = mediaMessage.mimetype;
+        } else {
+          mimetype = mimeTypes.lookup(mediaMessage.fileName);
+
+          if (!mimetype && isURL(mediaMessage.media)) {
+            let config: any = { responseType: 'arraybuffer' };
+
+            if (this.localProxy?.enabled) {
+              config = {
+                ...config,
+                httpsAgent: makeProxyAgent({
+                  host: this.localProxy.host,
+                  port: this.localProxy.port,
+                  protocol: this.localProxy.protocol,
+                  username: this.localProxy.username,
+                  password: this.localProxy.password,
+                }),
+              };
+            }
+
+            const response = await axios.get(mediaMessage.media, config);
+
+            mimetype = response.headers['content-type'];
+          }
+        }
+
+        if (mediaMessage.mediatype === 'ptv') {
+          prepareMedia[mediaType] = prepareMedia[type + 'Message'];
+          mimetype = 'video/mp4';
+
+          if (!prepareMedia[mediaType]) {
+            throw new Error('Failed to prepare video message');
+          }
+
+          try {
+            let mediaInput;
+            if (isURL(mediaMessage.media)) {
+              mediaInput = mediaMessage.media;
+            } else {
+              const mediaBuffer = Buffer.from(mediaMessage.media, 'base64');
+              if (!mediaBuffer || mediaBuffer.length === 0) {
+                throw new Error('Invalid media buffer');
+              }
+              mediaInput = mediaBuffer;
+            }
+
+            const duration = await getVideoDuration(mediaInput);
+            if (!duration || duration <= 0) {
+              throw new Error('Invalid media duration');
+            }
+
+            this.logger.verbose(`Video duration: ${duration} seconds`);
+            prepareMedia[mediaType].seconds = duration;
+          } catch (error) {
+            this.logger.error('Error getting video duration:');
+            this.logger.error(error);
+            throw new Error(`Failed to get video duration: ${error.message}`);
+          }
+        }
+
+        prepareMedia[mediaType].caption = mediaMessage?.caption;
+        prepareMedia[mediaType].mimetype = mimetype;
+        prepareMedia[mediaType].fileName = mediaMessage.fileName;
+
+        if (mediaMessage.mediatype === 'video') {
+          prepareMedia[mediaType].gifPlayback = false;
+        }
+
+        return generateWAMessageFromContent(
+          '',
+          { [mediaType]: { ...prepareMedia[mediaType] } },
+          { userJid: this.instance.wuid },
+        );
+      } catch (error) {
+        lastError = error;
+        const errorMsg =
+          error?.message || error?.toString() || 'Unknown error during media upload';
+
+        this.logger.error(`Media upload attempt ${attempt}/${maxRetries} failed: ${errorMsg}`);
+
+        // Se for erro de conexão e ainda temos tentativas, fazer retry
+        if (
+          attempt < maxRetries &&
+          (errorMsg.includes('upload') ||
+            errorMsg.includes('connection') ||
+            errorMsg.includes('ECONNRESET') ||
+            errorMsg.includes('timeout'))
+        ) {
+          const delayTime = retryDelayMs * attempt;
+          this.logger.warn(`Retrying in ${delayTime}ms...`);
+          await delay(delayTime);
+          continue;
+        }
+
+        // Se não é erro de upload ou acabaram as tentativas, lançar erro
+        if (attempt === maxRetries) {
+          throw new InternalServerErrorException(
+            `Media upload failed after ${maxRetries} attempts: ${errorMsg}`,
+          );
+        }
+
+        // Lançar erro imediatamente se não for erro de upload
+        throw new InternalServerErrorException(errorMsg);
       }
-
-      prepareMedia[mediaType].caption = mediaMessage?.caption;
-      prepareMedia[mediaType].mimetype = mimetype;
-      prepareMedia[mediaType].fileName = mediaMessage.fileName;
-
-      if (mediaMessage.mediatype === 'video') {
-        prepareMedia[mediaType].gifPlayback = false;
-      }
-
-      return generateWAMessageFromContent(
-        '',
-        { [mediaType]: { ...prepareMedia[mediaType] } },
-        { userJid: this.instance.wuid },
-      );
-    } catch (error) {
-      this.logger.error(error);
-      throw new InternalServerErrorException(error?.toString() || error);
     }
+
+    // Se chegou aqui, todas as tentativas falhar am
+    throw new InternalServerErrorException(
+      `Media upload failed after ${maxRetries} attempts: ${lastError?.message || lastError}`,
+    );
   }
 
   private async convertToWebP(image: string): Promise<Buffer> {

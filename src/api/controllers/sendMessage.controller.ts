@@ -31,6 +31,20 @@ function isEmoji(str: string) {
 export class SendMessageController {
   constructor(private readonly waMonitor: WAMonitoringService) {}
 
+  private checkConnectionStatus(instanceName: string): void {
+    const instance = this.waMonitor.waInstances[instanceName];
+    if (!instance) {
+      throw new BadRequestException(`Instance "${instanceName}" not found`);
+    }
+
+    const connectionState = instance.connectionStatus?.state;
+    if (connectionState !== 'open') {
+      throw new BadRequestException(
+        `Instance is not connected to WhatsApp. Current state: ${connectionState || 'unknown'}. Please wait for connection to be established before sending media.`,
+      );
+    }
+  }
+
   public async sendTemplate({ instanceName }: InstanceDto, data: SendTemplateDto) {
     return await this.waMonitor.waInstances[instanceName].templateMessage(data);
   }
@@ -40,6 +54,9 @@ export class SendMessageController {
   }
 
   public async sendMedia({ instanceName }: InstanceDto, data: SendMediaDto, file?: any) {
+    // Verificar conexão antes de processar mídia
+    this.checkConnectionStatus(instanceName);
+
     if (isBase64(data?.media) && !data?.fileName && data?.mediatype === 'document') {
       throw new BadRequestException('For base64 the file name must be informed.');
     }
@@ -51,6 +68,9 @@ export class SendMessageController {
   }
 
   public async sendPtv({ instanceName }: InstanceDto, data: SendPtvDto, file?: any) {
+    // Verificar conexão antes de processar mídia
+    this.checkConnectionStatus(instanceName);
+
     if (file || isURL(data?.video) || isBase64(data?.video)) {
       return await this.waMonitor.waInstances[instanceName].ptvMessage(data, file);
     }
@@ -58,6 +78,9 @@ export class SendMessageController {
   }
 
   public async sendSticker({ instanceName }: InstanceDto, data: SendStickerDto, file?: any) {
+    // Verificar conexão antes de processar mídia
+    this.checkConnectionStatus(instanceName);
+
     if (file || isURL(data.sticker) || isBase64(data.sticker)) {
       return await this.waMonitor.waInstances[instanceName].mediaSticker(data, file);
     }
@@ -65,6 +88,9 @@ export class SendMessageController {
   }
 
   public async sendWhatsAppAudio({ instanceName }: InstanceDto, data: SendAudioDto, file?: any) {
+    // Verificar conexão antes de processar mídia
+    this.checkConnectionStatus(instanceName);
+
     if (file?.buffer || isURL(data.audio) || isBase64(data.audio)) {
       // Si file existe y tiene buffer, o si es una URL o Base64, continúa
       return await this.waMonitor.waInstances[instanceName].audioWhatsapp(data, file);
@@ -102,6 +128,9 @@ export class SendMessageController {
   }
 
   public async sendStatus({ instanceName }: InstanceDto, data: SendStatusDto, file?: any) {
+    // Verificar conexão antes de processar mídia
+    this.checkConnectionStatus(instanceName);
+
     return await this.waMonitor.waInstances[instanceName].statusMessage(data, file);
   }
 }
