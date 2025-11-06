@@ -246,6 +246,15 @@ export class BaileysStartupService extends ChannelStartupService {
   private presenceInterval: NodeJS.Timeout | null = null;
   private lastActivity: number = Date.now();
 
+  // Event listener callbacks stored for cleanup
+  private wsCallListener: ((packet: any) => void) | null = null;
+  private wsCallAckListener: ((packet: any) => void) | null = null;
+
+  // Constants for cache limits
+  private readonly MAX_MESSAGE_STUB_RETRY_CACHE = 1000;
+  private readonly MAX_SESSION_ERROR_CACHE = 500;
+  private readonly SESSION_ERROR_TTL_MS = 3600000; // 1 hour
+
   public stateConnection: wa.StateConnection = { state: 'close' };
 
   public phoneNumber: string;
@@ -256,6 +265,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async logoutInstance() {
     this.stopPresenceManager();
+    this.cleanupEventListeners();
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
 
@@ -271,6 +281,58 @@ export class BaileysStartupService extends ChannelStartupService {
     if (this.presenceInterval) {
       clearInterval(this.presenceInterval);
       this.presenceInterval = null;
+    }
+  }
+
+  private cleanupEventListeners() {
+    try {
+      // Remove WebSocket event listeners
+      if (this.client?.ws) {
+        if (this.wsCallListener) {
+          this.client.ws.removeListener('CB:call', this.wsCallListener);
+          this.wsCallListener = null;
+        }
+        if (this.wsCallAckListener) {
+          this.client.ws.removeListener('CB:ack,class:call', this.wsCallAckListener);
+          this.wsCallAckListener = null;
+        }
+      }
+
+      // Clear cache maps with size limits
+      this.messageStubRetryCache.clear();
+      this.sessionErrorCache.clear();
+    } catch (error) {
+      this.logger.warn('Error during event listener cleanup:');
+      this.logger.warn(error);
+    }
+  }
+
+  private pruneMapCache<K, V>(map: Map<K, V>, maxSize: number) {
+    if (map.size >= maxSize) {
+      // Remove oldest entries (first 10% of max size)
+      const entriesToRemove = Math.floor(maxSize * 0.1);
+      const keysToDelete = Array.from(map.keys()).slice(0, entriesToRemove);
+      keysToDelete.forEach((key) => map.delete(key));
+      this.logger.verbose(`Pruned ${entriesToRemove} entries from cache (size was ${map.size + entriesToRemove})`);
+    }
+  }
+
+  private addToSessionErrorCache(jid: string) {
+    this.pruneMapCache(this.sessionErrorCache, this.MAX_SESSION_ERROR_CACHE);
+
+    const now = Date.now();
+    const existing = this.sessionErrorCache.get(jid);
+
+    if (existing && now - existing.lastError < this.SESSION_ERROR_TTL_MS) {
+      this.sessionErrorCache.set(jid, {
+        count: existing.count + 1,
+        lastError: now,
+      });
+    } else {
+      this.sessionErrorCache.set(jid, {
+        count: 1,
+        lastError: now,
+      });
     }
   }
 
@@ -711,6 +773,7 @@ export class BaileysStartupService extends ChannelStartupService {
     // Clean up old client before creating new one
     if (this.client) {
       try {
+        this.cleanupEventListeners();
         this.client.ws?.close();
         this.client.end(new Error('Reconnecting - cleaning old client'));
         // Destroy and recreate message processor to reset RxJS streams
@@ -733,17 +796,20 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.eventHandler();
 
-    this.client.ws.on('CB:call', (packet) => {
+    // Store callback references for later cleanup
+    this.wsCallListener = (packet) => {
       console.log('CB:call', packet);
       const payload = { event: 'CB:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
-    });
+    };
+    this.client.ws.on('CB:call', this.wsCallListener);
 
-    this.client.ws.on('CB:ack,class:call', (packet) => {
+    this.wsCallAckListener = (packet) => {
       console.log('CB:ack,class:call', packet);
       const payload = { event: 'CB:ack,class:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
-    });
+    };
+    this.client.ws.on('CB:ack,class:call', this.wsCallAckListener);
 
     this.phoneNumber = number;
 
@@ -1128,6 +1194,7 @@ export class BaileysStartupService extends ChannelStartupService {
           // Handle messageStubType 2 (Message absent from node) - cache for retry
           if ((received as any)?.messageStubType === 2 && received.key?.id) {
             this.logger.warn(`Message with stubType 2 cached for retry: ${received.key.id}`);
+            this.pruneMapCache(this.messageStubRetryCache, this.MAX_MESSAGE_STUB_RETRY_CACHE);
             this.messageStubRetryCache.set(received.key.id, received);
             continue;
           }
@@ -4753,6 +4820,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     const errorCount = cached ? cached.count + 1 : 1;
+    this.pruneMapCache(this.sessionErrorCache, this.MAX_SESSION_ERROR_CACHE);
     this.sessionErrorCache.set(jid, { count: errorCount, lastError: now });
 
     // Auto-clear threshold: 3 errors within 5 minutes

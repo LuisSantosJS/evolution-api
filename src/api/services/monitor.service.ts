@@ -39,11 +39,18 @@ export class WAMonitoringService {
 
   private readonly providerSession = Object.freeze(this.configService.get<ProviderSession>('PROVIDER'));
 
+  // Track deletion timeouts for cleanup
+  private instanceDeletionTimeouts: Map<string, NodeJS.Timeout> = new Map();
+
   public delInstanceTime(instance: string) {
+    // Clear any existing timeout for this instance
+    this.clearInstanceDeletionTimeout(instance);
+
     const time = this.configService.get<DelInstance>('DEL_INSTANCE');
     if (typeof time === 'number' && time > 0) {
-      setTimeout(
+      const timeoutId = setTimeout(
         async () => {
+          this.instanceDeletionTimeouts.delete(instance);
           if (this.waInstances[instance]?.connectionStatus?.state !== 'open') {
             if (this.waInstances[instance]?.connectionStatus?.state === 'connecting') {
               if ((await this.waInstances[instance].integration) === Integration.WHATSAPP_BAILEYS) {
@@ -59,6 +66,15 @@ export class WAMonitoringService {
         },
         1000 * 60 * time,
       );
+      this.instanceDeletionTimeouts.set(instance, timeoutId);
+    }
+  }
+
+  public clearInstanceDeletionTimeout(instance: string) {
+    const timeoutId = this.instanceDeletionTimeouts.get(instance);
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      this.instanceDeletionTimeouts.delete(instance);
     }
   }
 
@@ -358,6 +374,9 @@ export class WAMonitoringService {
     this.eventEmitter.on('remove.instance', async (instanceName: string) => {
       try {
         await this.waInstances[instanceName]?.sendDataWebhook(Events.REMOVE_INSTANCE, null);
+
+        // Clear any pending deletion timeout for this instance
+        this.clearInstanceDeletionTimeout(instanceName);
 
         this.cleaningUp(instanceName);
         this.cleaningStoreData(instanceName);

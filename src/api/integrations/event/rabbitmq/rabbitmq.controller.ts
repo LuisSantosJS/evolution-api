@@ -15,6 +15,13 @@ export class RabbitmqController extends EventController implements EventControll
   private maxReconnectDelay = 60000; // 60 seconds max delay
   private isReconnecting = false;
 
+  // Event listener callbacks and timeout tracking for cleanup
+  private connectionErrorListener: ((err: Error) => void) | null = null;
+  private connectionCloseListener: (() => void) | null = null;
+  private channelErrorListener: ((err: Error) => void) | null = null;
+  private channelCloseListener: (() => void) | null = null;
+  private reconnectTimeoutId: NodeJS.Timeout | null = null;
+
   constructor(prismaRepository: PrismaRepository, waMonitor: WAMonitoringService) {
     super(prismaRepository, waMonitor, configService.get<Rabbitmq>('RABBITMQ')?.ENABLED, 'rabbitmq');
   }
@@ -56,20 +63,22 @@ export class RabbitmqController extends EventController implements EventControll
           return;
         }
 
-        // Connection event handlers
-        connection.on('error', (err: Error) => {
+        // Store callback references for cleanup
+        this.connectionErrorListener = (err: Error) => {
           this.logger.error({
             local: 'RabbitmqController.connectionError',
             message: 'RabbitMQ connection error',
             error: err.message || err,
           });
           this.handleConnectionLoss();
-        });
+        };
+        connection.on('error', this.connectionErrorListener);
 
-        connection.on('close', () => {
+        this.connectionCloseListener = () => {
           this.logger.warn('RabbitMQ connection closed');
           this.handleConnectionLoss();
-        });
+        };
+        connection.on('close', this.connectionCloseListener);
 
         connection.createChannel((channelError: Error, channel: amqp.Channel) => {
           if (channelError) {
@@ -82,20 +91,22 @@ export class RabbitmqController extends EventController implements EventControll
             return;
           }
 
-          // Channel event handlers
-          channel.on('error', (err: Error) => {
+          // Store channel callback references for cleanup
+          this.channelErrorListener = (err: Error) => {
             this.logger.error({
               local: 'RabbitmqController.channelError',
               message: 'RabbitMQ channel error',
               error: err.message || err,
             });
             this.handleConnectionLoss();
-          });
+          };
+          channel.on('error', this.channelErrorListener);
 
-          channel.on('close', () => {
+          this.channelCloseListener = () => {
             this.logger.warn('RabbitMQ channel closed');
             this.handleConnectionLoss();
-          });
+          };
+          channel.on('close', this.channelCloseListener);
 
           const exchangeName = rabbitmqExchangeName;
 
@@ -156,11 +167,17 @@ export class RabbitmqController extends EventController implements EventControll
 
     this.logger.info(`Scheduling RabbitMQ reconnection attempt ${this.reconnectAttempts} in ${delay}ms`);
 
-    setTimeout(async () => {
+    // Clear any existing timeout
+    if (this.reconnectTimeoutId) {
+      clearTimeout(this.reconnectTimeoutId);
+    }
+
+    this.reconnectTimeoutId = setTimeout(async () => {
       try {
         this.logger.info(`Attempting to reconnect to RabbitMQ (attempt ${this.reconnectAttempts})`);
         await this.connect();
         this.logger.info('Successfully reconnected to RabbitMQ');
+        this.reconnectTimeoutId = null;
       } catch (error) {
         this.logger.error({
           local: 'RabbitmqController.scheduleReconnect',
@@ -168,6 +185,7 @@ export class RabbitmqController extends EventController implements EventControll
           error: error.message || error,
         });
         this.isReconnecting = false;
+        this.reconnectTimeoutId = null;
         this.scheduleReconnect(); // Continue trying indefinitely
       }
     }, delay);
@@ -447,11 +465,36 @@ export class RabbitmqController extends EventController implements EventControll
 
   public async cleanup(): Promise<void> {
     try {
+      // Clear reconnection timeout
+      if (this.reconnectTimeoutId) {
+        clearTimeout(this.reconnectTimeoutId);
+        this.reconnectTimeoutId = null;
+      }
+
+      // Remove event listeners from channel
       if (this.amqpChannel) {
+        if (this.channelErrorListener) {
+          this.amqpChannel.removeListener('error', this.channelErrorListener);
+          this.channelErrorListener = null;
+        }
+        if (this.channelCloseListener) {
+          this.amqpChannel.removeListener('close', this.channelCloseListener);
+          this.channelCloseListener = null;
+        }
         await this.amqpChannel.close();
         this.amqpChannel = null;
       }
+
+      // Remove event listeners from connection
       if (this.amqpConnection) {
+        if (this.connectionErrorListener) {
+          this.amqpConnection.removeListener('error', this.connectionErrorListener);
+          this.connectionErrorListener = null;
+        }
+        if (this.connectionCloseListener) {
+          this.amqpConnection.removeListener('close', this.connectionCloseListener);
+          this.connectionCloseListener = null;
+        }
         await this.amqpConnection.close();
         this.amqpConnection = null;
       }
@@ -461,8 +504,13 @@ export class RabbitmqController extends EventController implements EventControll
         message: 'Error during cleanup',
         error: error.message || error,
       });
+      // Ensure cleanup even if error occurs
       this.amqpChannel = null;
       this.amqpConnection = null;
+      this.channelErrorListener = null;
+      this.channelCloseListener = null;
+      this.connectionErrorListener = null;
+      this.connectionCloseListener = null;
     }
   }
 }

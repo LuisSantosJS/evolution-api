@@ -32,6 +32,23 @@ class ChatwootImport {
   private historyMessages = new Map<string, Message[]>();
   private historyContacts = new Map<string, Contact[]>();
 
+  // Cache limits to prevent unbounded growth
+  private readonly MAX_INSTANCES_IN_CACHE = 100;
+  private readonly MAX_MESSAGES_PER_INSTANCE = 50000;
+  private readonly MAX_CONTACTS_PER_INSTANCE = 10000;
+
+  private pruneOldestInstances<K, V>(map: Map<K, V>) {
+    if (map.size >= this.MAX_INSTANCES_IN_CACHE) {
+      // Remove oldest 10% of entries when limit is reached
+      const entriesToRemove = Math.floor(this.MAX_INSTANCES_IN_CACHE * 0.1);
+      const keysToDelete = Array.from(map.keys()).slice(0, entriesToRemove);
+      keysToDelete.forEach((key) => map.delete(key));
+      this.logger.warn(
+        `Pruned ${entriesToRemove} oldest instances from cache (size was ${map.size + entriesToRemove})`,
+      );
+    }
+  }
+
   public getRepositoryMessagesCache(instance: InstanceDto) {
     return this.repositoryMessagesCache.has(instance.instanceName)
       ? this.repositoryMessagesCache.get(instance.instanceName)
@@ -39,6 +56,7 @@ class ChatwootImport {
   }
 
   public setRepositoryMessagesCache(instance: InstanceDto, repositoryMessagesCache: Set<string>) {
+    this.pruneOldestInstances(this.repositoryMessagesCache);
     this.repositoryMessagesCache.set(instance.instanceName, repositoryMessagesCache);
   }
 
@@ -47,17 +65,47 @@ class ChatwootImport {
   }
 
   public addHistoryMessages(instance: InstanceDto, messagesRaw: Message[]) {
+    this.pruneOldestInstances(this.historyMessages);
+
     const actualValue = this.historyMessages.has(instance.instanceName)
       ? this.historyMessages.get(instance.instanceName)
       : [];
-    this.historyMessages.set(instance.instanceName, [...actualValue, ...messagesRaw]);
+    const newMessages = [...actualValue, ...messagesRaw];
+
+    // Limit messages per instance to prevent excessive memory usage
+    if (newMessages.length > this.MAX_MESSAGES_PER_INSTANCE) {
+      this.logger.warn(
+        `Message cache for instance ${instance.instanceName} exceeded limit (${newMessages.length}), keeping most recent ${this.MAX_MESSAGES_PER_INSTANCE}`,
+      );
+      this.historyMessages.set(
+        instance.instanceName,
+        newMessages.slice(newMessages.length - this.MAX_MESSAGES_PER_INSTANCE),
+      );
+    } else {
+      this.historyMessages.set(instance.instanceName, newMessages);
+    }
   }
 
   public addHistoryContacts(instance: InstanceDto, contactsRaw: Contact[]) {
+    this.pruneOldestInstances(this.historyContacts);
+
     const actualValue = this.historyContacts.has(instance.instanceName)
       ? this.historyContacts.get(instance.instanceName)
       : [];
-    this.historyContacts.set(instance.instanceName, actualValue.concat(contactsRaw));
+    const newContacts = actualValue.concat(contactsRaw);
+
+    // Limit contacts per instance to prevent excessive memory usage
+    if (newContacts.length > this.MAX_CONTACTS_PER_INSTANCE) {
+      this.logger.warn(
+        `Contact cache for instance ${instance.instanceName} exceeded limit (${newContacts.length}), keeping most recent ${this.MAX_CONTACTS_PER_INSTANCE}`,
+      );
+      this.historyContacts.set(
+        instance.instanceName,
+        newContacts.slice(newContacts.length - this.MAX_CONTACTS_PER_INSTANCE),
+      );
+    } else {
+      this.historyContacts.set(instance.instanceName, newContacts);
+    }
   }
 
   public deleteHistoryMessages(instance: InstanceDto) {

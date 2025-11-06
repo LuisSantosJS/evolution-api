@@ -16,6 +16,9 @@ export abstract class BaseChatbotService<BotType = any, SettingsType = any> {
   protected readonly prismaRepository: PrismaRepository;
   protected readonly configService?: ConfigService;
 
+  // Track active timeouts for cleanup
+  protected activeTimeouts: Set<NodeJS.Timeout> = new Set();
+
   constructor(
     waMonitor: WAMonitoringService,
     prismaRepository: PrismaRepository,
@@ -26,6 +29,17 @@ export abstract class BaseChatbotService<BotType = any, SettingsType = any> {
     this.prismaRepository = prismaRepository;
     this.logger = new Logger(loggerName);
     this.configService = configService;
+  }
+
+  /**
+   * Cleanup method to clear all active timeouts
+   * Should be called when the service is being destroyed
+   */
+  protected cleanupTimeouts(): void {
+    this.activeTimeouts.forEach((timeoutId) => {
+      clearTimeout(timeoutId);
+    });
+    this.activeTimeouts.clear();
   }
 
   /**
@@ -284,7 +298,8 @@ export abstract class BaseChatbotService<BotType = any, SettingsType = any> {
         }
 
         await new Promise<void>((resolve) => {
-          setTimeout(async () => {
+          const timeoutId = setTimeout(async () => {
+            this.activeTimeouts.delete(timeoutId);
             await instance.textMessage(
               {
                 number: remoteJid.split('@')[0],
@@ -295,6 +310,7 @@ export abstract class BaseChatbotService<BotType = any, SettingsType = any> {
             );
             resolve();
           }, delay);
+          this.activeTimeouts.add(timeoutId);
         });
 
         if (instance.integration === Integration.WHATSAPP_BAILEYS) {
@@ -310,7 +326,8 @@ export abstract class BaseChatbotService<BotType = any, SettingsType = any> {
       }
 
       await new Promise<void>((resolve) => {
-        setTimeout(async () => {
+        const timeoutId = setTimeout(async () => {
+          this.activeTimeouts.delete(timeoutId);
           await instance.textMessage(
             {
               number: remoteJid.split('@')[0],
@@ -321,6 +338,7 @@ export abstract class BaseChatbotService<BotType = any, SettingsType = any> {
           );
           resolve();
         }, delay);
+        this.activeTimeouts.add(timeoutId);
       });
 
       if (instance.integration === Integration.WHATSAPP_BAILEYS) {
