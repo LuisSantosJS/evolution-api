@@ -362,11 +362,44 @@ export class InstanceController {
     }
   }
 
+  /**
+   * Retorna o estado da conexão de forma confiável
+   * SEMPRE retorna estado in-memory quando disponível (fonte única da verdade)
+   */
   public async connectionState({ instanceName }: InstanceDto) {
+    const instance = this.waMonitor.waInstances[instanceName];
+
+    if (!instance) {
+      // Instância não encontrada em memória - buscar do banco
+      const dbInstance = await this.prismaRepository.instance.findFirst({
+        where: { name: instanceName },
+      });
+
+      if (!dbInstance) {
+        throw new BadRequestException(`Instance "${instanceName}" not found`);
+      }
+
+      return {
+        instance: {
+          instanceName: instanceName,
+          state: dbInstance.connectionStatus,
+          statusSource: 'database',
+          isReady: false,
+        },
+      };
+    }
+
+    // Instância encontrada em memória - usar estado real
+    const state = instance.stateConnection?.state || instance.connectionStatus?.state || 'unknown';
+    const isReady = typeof instance.isConnectionReady === 'function' ? instance.isConnectionReady() : false;
+
     return {
       instance: {
         instanceName: instanceName,
-        state: this.waMonitor.waInstances[instanceName]?.connectionStatus?.state,
+        state: state,
+        statusSource: 'live',
+        isReady: isReady,
+        statusReason: instance.stateConnection?.statusReason,
       },
     };
   }

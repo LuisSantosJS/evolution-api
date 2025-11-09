@@ -121,7 +121,35 @@ export class WAMonitoringService {
       },
     });
 
-    return instances;
+    // CORREÇÃO CRÍTICA: Merge com estado in-memory (fonte única da verdade)
+    // Retorna estado real da conexão em memória quando disponível
+    const enrichedInstances = instances.map((instance) => {
+      const liveInstance = this.waInstances[instance.name];
+
+      if (liveInstance && liveInstance.stateConnection) {
+        // Instância está em memória - usar estado real
+        return {
+          ...instance,
+          connectionStatus: liveInstance.stateConnection.state,
+          // Adicionar flag indicando que é estado live
+          _meta: {
+            statusSource: 'live',
+            isReady: typeof liveInstance.isConnectionReady === 'function' ? liveInstance.isConnectionReady() : false,
+          },
+        };
+      }
+
+      // Instância não está em memória - retornar do banco
+      return {
+        ...instance,
+        _meta: {
+          statusSource: 'database',
+          isReady: false,
+        },
+      };
+    });
+
+    return enrichedInstances;
   }
 
   public async instanceInfoById(instanceId?: string, number?: string) {
@@ -413,7 +441,10 @@ export class WAMonitoringService {
         this.waInstances[instanceName]?.client?.ws?.close();
 
         this.waInstances[instanceName].instance.qrcode = { count: 0 };
-        this.waInstances[instanceName].stateConnection.state = 'close';
+
+        // CORREÇÃO: Não atualizar stateConnection diretamente
+        // O próprio baileys service vai atualizar via connectionUpdate event
+        // Remover: this.waInstances[instanceName].stateConnection.state = 'close';
       } catch (error) {
         this.logger.error({
           localError: 'noConnection',

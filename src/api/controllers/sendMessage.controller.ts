@@ -31,17 +31,32 @@ function isEmoji(str: string) {
 export class SendMessageController {
   constructor(private readonly waMonitor: WAMonitoringService) {}
 
+  /**
+   * Verifica se a instância está pronta para enviar mídias
+   * Usa verificação robusta que vai além do simples state === 'open'
+   */
   private checkConnectionStatus(instanceName: string): void {
     const instance = this.waMonitor.waInstances[instanceName];
     if (!instance) {
       throw new BadRequestException(`Instance "${instanceName}" not found`);
     }
 
-    const connectionState = instance.connectionStatus?.state;
-    if (connectionState !== 'open') {
-      throw new BadRequestException(
-        `Instance is not connected to WhatsApp. Current state: ${connectionState || 'unknown'}. Please wait for connection to be established before sending media.`,
-      );
+    // Usar o método robusto isConnectionReady() ao invés de apenas verificar o state
+    if (typeof instance.isConnectionReady === 'function') {
+      if (!instance.isConnectionReady()) {
+        const connectionState = instance.connectionStatus?.state || 'unknown';
+        throw new BadRequestException(
+          `Instance is not ready to send media. Current state: ${connectionState}. The connection may be establishing or unstable. Please wait a moment and try again.`,
+        );
+      }
+    } else {
+      // Fallback para verificação antiga se o método não existir (compatibilidade)
+      const connectionState = instance.connectionStatus?.state;
+      if (connectionState !== 'open') {
+        throw new BadRequestException(
+          `Instance is not connected to WhatsApp. Current state: ${connectionState || 'unknown'}. Please wait for connection to be established before sending media.`,
+        );
+      }
     }
   }
 

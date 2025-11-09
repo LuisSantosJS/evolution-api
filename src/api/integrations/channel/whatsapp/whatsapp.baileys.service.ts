@@ -249,6 +249,19 @@ export class BaileysStartupService extends ChannelStartupService {
   // Event listener callbacks stored for cleanup
   private wsCallListener: ((packet: any) => void) | null = null;
   private wsCallAckListener: ((packet: any) => void) | null = null;
+  private wsErrorListener: ((error: Error) => void) | null = null;
+  private wsCloseListener: ((code: number, reason: Buffer) => void) | null = null;
+  private wsPongListener: (() => void) | null = null;
+
+  // Reconnection lock to prevent simultaneous reconnections
+  private reconnectLock = false;
+  private isClientReady = false;
+  private clientReadyTimeout: NodeJS.Timeout | null = null; // NOVO: Para limpar timeout
+
+  // Status synchronization
+  private statusUpdateLock = false;
+  private lastDatabaseStatusUpdate: { state: string; timestamp: number } | null = null;
+  private readonly STATUS_SYNC_DEBOUNCE_MS = 1000; // Debounce database updates
 
   // Constants for cache limits
   private readonly MAX_MESSAGE_STUB_RETRY_CACHE = 1000;
@@ -261,6 +274,162 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public get connectionStatus() {
     return this.stateConnection;
+  }
+
+  /**
+   * Verifica se a conexão está realmente pronta para enviar mensagens e mídias
+   * Implementa verificações robustas além do simples state === 'open'
+   */
+  public isConnectionReady(): boolean {
+    try {
+      // Verificação 1: Estado básico da conexão
+      if (this.stateConnection.state !== 'open') {
+        this.logger.verbose(`Connection not ready: state is '${this.stateConnection.state}'`);
+        return false;
+      }
+
+      // Verificação 2: Cliente existe e não está marcado para encerramento
+      if (!this.client || this.endSession) {
+        this.logger.verbose(`Connection not ready: client=${!!this.client}, endSession=${this.endSession}`);
+        return false;
+      }
+
+      // Verificação 3: WebSocket está conectado (readyState === 1 = OPEN)
+      if (!this.client.ws || (this.client.ws as any).readyState !== 1) {
+        this.logger.verbose(`Connection not ready: WebSocket readyState=${(this.client.ws as any)?.readyState ?? 'undefined'}`);
+        return false;
+      }
+
+      // Verificação 4: User ID está definido (autenticação completa)
+      if (!this.client.user || !this.client.user.id) {
+        this.logger.verbose(`Connection not ready: user not authenticated`);
+        return false;
+      }
+
+      // Verificação 5: Flag de cliente pronto está ativada
+      if (!this.isClientReady) {
+        this.logger.verbose(`Connection not ready: client initialization not complete`);
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      this.logger.error(`Error checking connection readiness: ${error.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Atualiza o status da conexão de forma atômica e sincronizada
+   * - Atualiza memória imediatamente (in-memory state)
+   * - Atualiza banco de dados de forma assíncrona com debounce
+   * - Garante consistência entre todas as fontes de status
+   *
+   * @param newState - Novo estado da conexão
+   * @param additionalData - Dados adicionais para atualizar no banco (opcional)
+   */
+  private async updateConnectionStatus(
+    newState: 'open' | 'close' | 'connecting',
+    additionalData?: {
+      ownerJid?: string;
+      profileName?: string;
+      profilePicUrl?: string;
+      disconnectionAt?: Date;
+      disconnectionReasonCode?: number;
+      disconnectionObject?: string;
+    },
+  ) {
+    const previousState = this.stateConnection.state;
+
+    // 1. Atualizar estado em memória IMEDIATAMENTE (fonte única da verdade)
+    this.stateConnection.state = newState;
+    this.logger.verbose(`Connection status updated in memory: ${previousState} -> ${newState}`);
+
+    // 2. Atualizar banco de dados de forma assíncrona e com debounce
+    // Não bloquear a operação principal
+    this.updateDatabaseStatusAsync(newState, additionalData).catch((err) => {
+      this.logger.error(`Failed to sync connection status to database: ${err.message}`);
+      // Não fazer rollback do estado em memória - memória é a fonte da verdade
+    });
+  }
+
+  /**
+   * Atualiza o status no banco de dados de forma assíncrona com debounce
+   * Previne atualizações excessivas ao banco durante mudanças rápidas de estado
+   */
+  private async updateDatabaseStatusAsync(
+    state: string,
+    additionalData?: {
+      ownerJid?: string;
+      profileName?: string;
+      profilePicUrl?: string;
+      disconnectionAt?: Date;
+      disconnectionReasonCode?: number;
+      disconnectionObject?: string;
+    },
+  ) {
+    // Debounce: Se última atualização foi recente e para o mesmo estado, skip
+    const now = Date.now();
+    if (
+      this.lastDatabaseStatusUpdate &&
+      this.lastDatabaseStatusUpdate.state === state &&
+      now - this.lastDatabaseStatusUpdate.timestamp < this.STATUS_SYNC_DEBOUNCE_MS
+    ) {
+      this.logger.verbose(`Debouncing database status update for state: ${state}`);
+      return;
+    }
+
+    // CORREÇÃO: Prevenir atualizações simultâneas com retry limitado
+    const maxRetries = 5;
+    const retryDelay = 100;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      if (!this.statusUpdateLock) {
+        break; // Lock está livre, pode prosseguir
+      }
+
+      if (attempt === maxRetries - 1) {
+        // Última tentativa - skip update para evitar bloqueio
+        this.logger.warn(`Status update skipped after ${maxRetries} attempts - lock still held`);
+        return;
+      }
+
+      this.logger.verbose(`Status update lock held, waiting... (attempt ${attempt + 1}/${maxRetries})`);
+      await delay(retryDelay);
+    }
+
+    try {
+      this.statusUpdateLock = true;
+
+      const updateData: any = {
+        connectionStatus: state,
+        ...additionalData,
+      };
+
+      await this.prismaRepository.instance.update({
+        where: { id: this.instanceId },
+        data: updateData,
+      });
+
+      this.lastDatabaseStatusUpdate = { state, timestamp: now };
+      this.logger.verbose(`Database status synced successfully: ${state}`);
+    } catch (error) {
+      this.logger.error(`Database status sync failed: ${error.message}`);
+      throw error;
+    } finally {
+      this.statusUpdateLock = false;
+    }
+  }
+
+  /**
+   * Retorna o estado atual da conexão de forma confiável
+   * Sempre retorna o estado em memória (fonte única da verdade)
+   */
+  public getConnectionState(): wa.StateConnection {
+    return {
+      state: this.stateConnection.state,
+      statusReason: this.stateConnection.statusReason,
+    };
   }
 
   public async logoutInstance() {
@@ -295,6 +464,19 @@ export class BaileysStartupService extends ChannelStartupService {
         if (this.wsCallAckListener) {
           this.client.ws.removeListener('CB:ack,class:call', this.wsCallAckListener);
           this.wsCallAckListener = null;
+        }
+        // CORREÇÃO: Remover novos listeners também
+        if (this.wsErrorListener) {
+          this.client.ws.removeListener('error', this.wsErrorListener);
+          this.wsErrorListener = null;
+        }
+        if (this.wsCloseListener) {
+          this.client.ws.removeListener('close', this.wsCloseListener);
+          this.wsCloseListener = null;
+        }
+        if (this.wsPongListener) {
+          this.client.ws.removeListener('pong', this.wsPongListener);
+          this.wsPongListener = null;
         }
       }
 
@@ -473,25 +655,61 @@ export class BaileysStartupService extends ChannelStartupService {
         ),
       );
 
-      await this.prismaRepository.instance.update({
-        where: { id: this.instanceId },
-        data: { connectionStatus: 'connecting' },
-      });
+      // Usar método atômico para atualizar status
+      await this.updateConnectionStatus('connecting');
     }
 
+    // Atualizar statusReason ANTES de processar mudanças de estado
     if (connection) {
-      this.stateConnection = {
-        state: connection,
-        statusReason: (lastDisconnect?.error as Boom)?.output?.statusCode ?? 200,
-      };
+      this.stateConnection.statusReason = (lastDisconnect?.error as Boom)?.output?.statusCode ?? 200;
     }
 
+    // Processar mudança de estado baseado no valor de 'connection'
     if (connection === 'close') {
+      // Mark client as not ready when connection closes
+      this.isClientReady = false;
+
+      // Clear any pending clientReady timeout
+      if (this.clientReadyTimeout) {
+        clearTimeout(this.clientReadyTimeout);
+        this.clientReadyTimeout = null;
+      }
+
+      // Stop presence manager immediately when closing
+      this.stopPresenceManager();
+
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
-      if (shouldReconnect) {
-        await this.connectToWhatsapp(this.phoneNumber);
+
+      if (shouldReconnect && !this.reconnectLock) {
+        this.reconnectLock = true;
+        this.logger.info('Initiating reconnection with lock...');
+
+        // Atualizar status para 'close' atomicamente
+        await this.updateConnectionStatus('close', {
+          disconnectionAt: new Date(),
+          disconnectionReasonCode: statusCode,
+          disconnectionObject: JSON.stringify(lastDisconnect),
+        });
+
+        try {
+          // Small delay to ensure clean state before reconnecting
+          await delay(1000);
+          await this.connectToWhatsapp(this.phoneNumber);
+        } catch (error) {
+          this.logger.error(`Reconnection failed: ${error.message}`);
+        } finally {
+          this.reconnectLock = false;
+        }
+      } else if (this.reconnectLock) {
+        this.logger.warn('Reconnection already in progress, skipping duplicate reconnection attempt');
+        // Atualizar status mesmo se reconexão já está em progresso
+        await this.updateConnectionStatus('close', {
+          disconnectionAt: new Date(),
+          disconnectionReasonCode: statusCode,
+          disconnectionObject: JSON.stringify(lastDisconnect),
+        });
       } else {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
@@ -501,14 +719,11 @@ export class BaileysStartupService extends ChannelStartupService {
           disconnectionObject: JSON.stringify(lastDisconnect),
         });
 
-        await this.prismaRepository.instance.update({
-          where: { id: this.instanceId },
-          data: {
-            connectionStatus: 'close',
-            disconnectionAt: new Date(),
-            disconnectionReasonCode: statusCode,
-            disconnectionObject: JSON.stringify(lastDisconnect),
-          },
+        // Usar método atômico para atualizar status
+        await this.updateConnectionStatus('close', {
+          disconnectionAt: new Date(),
+          disconnectionReasonCode: statusCode,
+          disconnectionObject: JSON.stringify(lastDisconnect),
         });
 
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
@@ -523,7 +738,11 @@ export class BaileysStartupService extends ChannelStartupService {
         this.client?.ws?.close();
         this.client.end(new Error('Close connection'));
 
-        this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+        this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+          instance: this.instance.name,
+          state: 'close', // Usar valor explícito
+          statusReason: this.stateConnection.statusReason,
+        });
       }
     }
 
@@ -550,14 +769,11 @@ export class BaileysStartupService extends ChannelStartupService {
       `,
       );
 
-      await this.prismaRepository.instance.update({
-        where: { id: this.instanceId },
-        data: {
-          ownerJid: this.instance.wuid,
-          profileName: (await this.getProfileName()) as string,
-          profilePicUrl: this.instance.profilePictureUrl,
-          connectionStatus: 'open',
-        },
+      // Usar método atômico para atualizar status + dados adicionais
+      await this.updateConnectionStatus('open', {
+        ownerJid: this.instance.wuid,
+        profileName: (await this.getProfileName()) as string,
+        profilePicUrl: this.instance.profilePictureUrl,
       });
 
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
@@ -574,19 +790,38 @@ export class BaileysStartupService extends ChannelStartupService {
         wuid: this.instance.wuid,
         profileName: await this.getProfileName(),
         profilePictureUrl: this.instance.profilePictureUrl,
-        ...this.stateConnection,
+        state: 'open', // Usar valor explícito
+        statusReason: this.stateConnection.statusReason,
       });
 
       // Start automatic presence manager
       this.startPresenceManager();
+
+      // Mark client as ready after all initialization is complete
+      // Small delay to ensure all async operations are done
+      // CORREÇÃO: Armazenar timeout para permitir limpeza
+      if (this.clientReadyTimeout) {
+        clearTimeout(this.clientReadyTimeout);
+      }
+      this.clientReadyTimeout = setTimeout(() => {
+        this.isClientReady = true;
+        this.logger.info('Client marked as ready for operations');
+        this.clientReadyTimeout = null;
+      }, 1500);
     }
 
     if (connection === 'connecting') {
-      this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
-    }
+      // CORREÇÃO: Atualizar state para 'connecting' se ainda não foi atualizado via QR
+      // Isso garante que state está correto mesmo se evento connecting vier sem QR
+      if (this.stateConnection.state !== 'connecting') {
+        await this.updateConnectionStatus('connecting');
+      }
 
-    if (connection === 'close') {
-      this.stopPresenceManager();
+      this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+        instance: this.instance.name,
+        state: 'connecting', // Usar valor explícito ao invés de spread
+        statusReason: this.stateConnection.statusReason,
+      });
     }
   }
 
@@ -724,13 +959,14 @@ export class BaileysStartupService extends ChannelStartupService {
       getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
       ...browserOptions,
       markOnlineOnConnect: this.localSettings.alwaysOnline,
-      retryRequestDelayMs: 350,
-      maxMsgRetryCount: 4,
+      retryRequestDelayMs: 1000, // AUMENTADO: 350ms -> 1000ms para maior estabilidade
+      maxMsgRetryCount: 6, // AUMENTADO: 4 -> 6 tentativas para maior confiabilidade
       fireInitQueries: true,
-      connectTimeoutMs: 30_000,
-      keepAliveIntervalMs: 30_000,
-      qrTimeout: 45_000,
+      connectTimeoutMs: 60_000, // AUMENTADO: 30s -> 60s para redes lentas
+      keepAliveIntervalMs: 25_000, // REDUZIDO: 30s -> 25s para detectar desconexões mais rápido
+      qrTimeout: 60_000, // AUMENTADO: 45s -> 60s para dar mais tempo ao usuário
       emitOwnEvents: false,
+      defaultQueryTimeoutMs: 60_000, // ADICIONADO: timeout para queries
       shouldIgnoreJid: (jid) => {
         if (this.localSettings.syncFullHistory && isJidGroup(jid)) {
           return false;
@@ -748,7 +984,7 @@ export class BaileysStartupService extends ChannelStartupService {
       },
       cachedGroupMetadata: this.getGroupMetadataCache,
       userDevicesCache: this.userDevicesCache,
-      transactionOpts: { maxCommitRetries: 10, delayBetweenTriesMs: 3000 },
+      transactionOpts: { maxCommitRetries: 5, delayBetweenTriesMs: 2000 }, // REDUZIDO: 10->5 retries, 3s->2s delay
       patchMessageBeforeSending(message) {
         if (
           message.deviceSentMessage?.message?.listMessage?.listType === proto.Message.ListMessage.ListType.PRODUCT_LIST
@@ -769,51 +1005,139 @@ export class BaileysStartupService extends ChannelStartupService {
     };
 
     this.endSession = false;
+    this.isClientReady = false;
 
-    // Clean up old client before creating new one
+    // Clean up old client before creating new one with robust error handling
     if (this.client) {
+      this.logger.info('Cleaning up old client before creating new connection...');
+
       try {
+        // Step 1: Stop presence manager
+        this.stopPresenceManager();
+
+        // Step 1.5: Clear any pending clientReady timeout
+        if (this.clientReadyTimeout) {
+          clearTimeout(this.clientReadyTimeout);
+          this.clientReadyTimeout = null;
+        }
+
+        // Step 2: Remove event listeners
         this.cleanupEventListeners();
-        this.client.ws?.close();
+
+        // Step 3: Force WebSocket closure if still open
+        if (this.client.ws) {
+          const wsState = (this.client.ws as any).readyState;
+          this.logger.verbose(`WebSocket state before cleanup: ${wsState} (0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED)`);
+
+          if (wsState !== 3) {
+            // 3 = CLOSED
+            try {
+              // Remove all listeners before closing to prevent events during shutdown
+              this.client.ws.removeAllListeners();
+              this.client.ws.close();
+              this.logger.verbose('WebSocket closed and listeners removed');
+            } catch (wsError) {
+              this.logger.warn(`Error closing WebSocket: ${wsError.message}`);
+            }
+          }
+        }
+
+        // Step 4: End client connection properly
         this.client.end(new Error('Reconnecting - cleaning old client'));
-        // Destroy and recreate message processor to reset RxJS streams
+        this.logger.verbose('Client ended');
+
+        // Step 5: Small delay to ensure cleanup completes
+        await delay(500);
+
+        // Step 6: Destroy and recreate message processor to reset RxJS streams
         this.messageProcessor.onDestroy();
         this.messageProcessor = new BaileysMessageProcessor();
         this.messageProcessor.mount({
           onMessageReceive: this.messageHandle['messages.upsert'].bind(this),
         });
+        this.logger.verbose('Message processor reset');
+
+        // Step 7: Clear client reference
+        this.client = null;
+
+        this.logger.info('Old client cleanup completed successfully');
       } catch (error) {
-        this.logger.warn('Error cleaning up old client:');
-        this.logger.warn(error);
+        this.logger.error('Error during client cleanup (continuing anyway):');
+        this.logger.error(error);
+        // Force clear the client even on error
+        this.client = null;
       }
+
+      // Additional delay to ensure complete cleanup
+      await delay(500);
     }
 
+    this.logger.info('Creating new WhatsApp client...');
     this.client = makeWASocket(socketConfig);
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
     }
 
+    // Setup event handler FIRST
     this.eventHandler();
 
-    // Store callback references for later cleanup
-    this.wsCallListener = (packet) => {
-      console.log('CB:call', packet);
-      const payload = { event: 'CB:call', packet: packet };
-      this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
-    };
-    this.client.ws.on('CB:call', this.wsCallListener);
-
-    this.wsCallAckListener = (packet) => {
-      console.log('CB:ack,class:call', packet);
-      const payload = { event: 'CB:ack,class:call', packet: packet };
-      this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
-    };
-    this.client.ws.on('CB:ack,class:call', this.wsCallAckListener);
+    // Setup WebSocket event listeners with error handling
+    this.setupWebSocketListeners();
 
     this.phoneNumber = number;
 
     return this.client;
+  }
+
+  /**
+   * Configura listeners de WebSocket com tratamento de erros robusto
+   * Previne memory leaks e garante limpeza adequada
+   */
+  private setupWebSocketListeners() {
+    if (!this.client || !this.client.ws) {
+      this.logger.warn('Cannot setup WebSocket listeners: client or ws not available');
+      return;
+    }
+
+    try {
+      // Store callback references for later cleanup
+      this.wsCallListener = (packet) => {
+        console.log('CB:call', packet);
+        const payload = { event: 'CB:call', packet: packet };
+        this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
+      };
+      this.client.ws.on('CB:call', this.wsCallListener);
+
+      this.wsCallAckListener = (packet) => {
+        console.log('CB:ack,class:call', packet);
+        const payload = { event: 'CB:ack,class:call', packet: packet };
+        this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
+      };
+      this.client.ws.on('CB:ack,class:call', this.wsCallAckListener);
+
+      // CORREÇÃO: Armazenar referências para permitir limpeza
+      this.wsErrorListener = (error) => {
+        this.logger.error(`WebSocket error: ${error.message}`);
+        this.logger.error(error);
+      };
+      this.client.ws.on('error', this.wsErrorListener);
+
+      this.wsCloseListener = (code, reason) => {
+        this.logger.warn(`WebSocket closed: code=${code}, reason=${reason?.toString()}`);
+        // O baileys já gerencia reconexão, apenas logar
+      };
+      this.client.ws.on('close', this.wsCloseListener);
+
+      this.wsPongListener = () => {
+        this.logger.verbose('WebSocket pong received (connection alive)');
+      };
+      this.client.ws.on('pong', this.wsPongListener);
+
+      this.logger.verbose('WebSocket listeners configured successfully');
+    } catch (error) {
+      this.logger.error(`Error setting up WebSocket listeners: ${error.message}`);
+    }
   }
 
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
@@ -2656,25 +2980,33 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // Log inicial
     this.logger.verbose(
-      `Preparing media message - Type: ${mediaMessage.mediatype}, Connection state: ${this.stateConnection.state}`,
+      `Preparing media message - Type: ${mediaMessage.mediatype}, Connection ready: ${this.isConnectionReady()}`,
     );
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        // Verificar estado da conexão antes de tentar upload
-        if (this.stateConnection.state !== 'open') {
+        // Verificação robusta do estado da conexão usando isConnectionReady()
+        if (!this.isConnectionReady()) {
           this.logger.warn(
-            `Connection not open (state: ${this.stateConnection.state}), attempt ${attempt}/${maxRetries}`,
+            `Connection not ready for media upload, attempt ${attempt}/${maxRetries} - State: ${this.stateConnection.state}`,
           );
 
           if (attempt < maxRetries) {
-            await delay(retryDelayMs * attempt); // Backoff exponencial
+            // Backoff exponencial: espera mais tempo a cada tentativa
+            const waitTime = retryDelayMs * attempt;
+            this.logger.verbose(`Waiting ${waitTime}ms before retry...`);
+            await delay(waitTime);
             continue;
           }
 
           throw new BadRequestException(
-            `Instance is not connected to WhatsApp. Current state: ${this.stateConnection.state}. Please wait for connection to be established.`,
+            `Instance is not ready to send media. Current state: ${this.stateConnection.state}. Please wait for connection to be fully established.`,
           );
+        }
+
+        // Verificação adicional: confirmar que o cliente ainda está pronto IMEDIATAMENTE antes do upload
+        if (!this.client || !this.client.user) {
+          throw new BadRequestException('Client not properly initialized for media upload');
         }
 
         const type = mediaMessage.mediatype === 'ptv' ? 'video' : mediaMessage.mediatype;
@@ -2717,6 +3049,14 @@ export class BaileysStartupService extends ChannelStartupService {
         const mediaSize = Buffer.isBuffer(mediaInput) ? mediaInput.length : 'URL';
         this.logger.verbose(`Media size: ${mediaSize}, attempting upload (${attempt}/${maxRetries})`);
 
+        // Verificação imediatamente antes do upload
+        if (!this.isConnectionReady()) {
+          throw new BadRequestException('Connection lost before media upload could start');
+        }
+
+        const uploadStartTime = Date.now();
+
+        // Executar upload com verificação periódica
         const prepareMedia = await prepareWAMessageMedia(
           {
             [type]: mediaInput,
@@ -2724,7 +3064,14 @@ export class BaileysStartupService extends ChannelStartupService {
           { upload: this.client.waUploadToServer },
         );
 
-        this.logger.verbose(`Media upload successful on attempt ${attempt}/${maxRetries}`);
+        // Verificar se conexão ainda está ativa após upload
+        if (!this.isConnectionReady()) {
+          this.logger.warn('Connection lost after media upload');
+          // Não lançar erro aqui pois o upload já foi concluído
+        }
+
+        const uploadDuration = Date.now() - uploadStartTime;
+        this.logger.verbose(`Media upload successful on attempt ${attempt}/${maxRetries} (took ${uploadDuration}ms)`);
 
         const mediaType = mediaMessage.mediatype + 'Message';
 
