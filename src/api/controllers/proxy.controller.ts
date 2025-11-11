@@ -35,7 +35,46 @@ export class ProxyController {
       }
     }
 
-    return this.proxyService.create(instance, data);
+    const result = await this.proxyService.create(instance, data);
+
+    // Se a instância não está conectada, reinicia para aplicar o proxy e gerar novo QR
+    const waInstance = this.waMonitor.waInstances[instance.instanceName];
+    const connectionState = waInstance?.connectionStatus?.state;
+
+    if (connectionState === 'close' && data?.enabled) {
+      logger.info(`Instance ${instance.instanceName} is disconnected. Reconnecting with new proxy...`);
+      try {
+        await waInstance.connectToWhatsapp();
+
+        // Aguarda até 15 segundos para QR code ser gerado
+        const maxAttempts = 30; // 15 segundos (500ms * 30)
+        let attempts = 0;
+        let qrCode;
+
+        while (attempts < maxAttempts) {
+          qrCode = waInstance.qrCode;
+          if (qrCode?.base64) {
+            break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 500));
+          attempts++;
+        }
+
+        return {
+          ...result,
+          qrcode: qrCode,
+          message: 'Proxy configured and instance reconnected successfully',
+        };
+      } catch (error) {
+        logger.error(`Failed to reconnect instance with new proxy: ${error}`);
+        return {
+          ...result,
+          message: 'Proxy configured but failed to reconnect. Please restart instance manually.',
+        };
+      }
+    }
+
+    return result;
   }
 
   public async findProxy(instance: InstanceDto) {

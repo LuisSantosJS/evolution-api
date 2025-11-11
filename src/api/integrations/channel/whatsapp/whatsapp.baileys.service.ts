@@ -961,7 +961,7 @@ export class BaileysStartupService extends ChannelStartupService {
       markOnlineOnConnect: this.localSettings.alwaysOnline,
       retryRequestDelayMs: 1000, // AUMENTADO: 350ms -> 1000ms para maior estabilidade
       maxMsgRetryCount: 6, // AUMENTADO: 4 -> 6 tentativas para maior confiabilidade
-      fireInitQueries: true,
+      fireInitQueries: false, // DESABILITADO: Evita sincronizações automáticas que bloqueiam mensagens em tempo real
       connectTimeoutMs: 60_000, // AUMENTADO: 30s -> 60s para redes lentas
       keepAliveIntervalMs: 25_000, // REDUZIDO: 30s -> 25s para detectar desconexões mais rápido
       qrTimeout: 60_000, // AUMENTADO: 45s -> 60s para dar mais tempo ao usuário
@@ -1504,8 +1504,13 @@ export class BaileysStartupService extends ChannelStartupService {
         // Mark activity when receiving messages
         this.markActivity();
 
-        // Filter out history sync messages - only process 'notify' type
+        // Log message type for diagnostics
+        this.logger.verbose(`messages.upsert received: type=${type}, count=${messages.length}`);
+
+        // Only process 'notify' and 'append' types (real-time messages)
+        // Note: History sync comes through 'messaging-history.set' event, not 'messages.upsert'
         if (type !== 'notify' && type !== 'append') {
+          this.logger.verbose(`Ignoring messages with type: ${type}`);
           return;
         }
 
@@ -1620,12 +1625,9 @@ export class BaileysStartupService extends ChannelStartupService {
           // }
           // await this.baileysCache.set(messageKey, true, 5 * 60);
 
-          if (
-            (type !== 'notify' && type !== 'append') ||
-            editedMessage ||
-            received.message?.pollUpdateMessage ||
-            !received?.message
-          ) {
+          // Skip edited messages (already processed above), poll updates, and messages without content
+          // Note: Type check (notify/append) is redundant here as we already filtered at the top
+          if (editedMessage || received.message?.pollUpdateMessage || !received?.message) {
             continue;
           }
 
@@ -2148,10 +2150,23 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler() {
+    // Cache settings to avoid database query on every event (performance critical)
+    let settingsCache: any = null;
+    let settingsCacheTime = 0;
+    const SETTINGS_CACHE_TTL = 30000; // 30 seconds
+
     this.client.ev.process(async (events) => {
       if (!this.endSession) {
         const database = this.configService.get<Database>('DATABASE');
-        const settings = await this.findSettings();
+
+        // Use cached settings or fetch if expired (avoid blocking event processing)
+        const now = Date.now();
+        if (!settingsCache || (now - settingsCacheTime) > SETTINGS_CACHE_TTL) {
+          settingsCache = await this.findSettings();
+          settingsCacheTime = now;
+          this.logger.verbose('Settings cache refreshed');
+        }
+        const settings = settingsCache;
 
         if (events.call) {
           const call = events.call[0];

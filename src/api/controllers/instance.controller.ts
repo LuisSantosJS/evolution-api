@@ -148,8 +148,25 @@ export class InstanceController {
 
         if (instanceData.qrcode && instanceData.integration === Integration.WHATSAPP_BAILEYS) {
           await instance.connectToWhatsapp(instanceData.number);
-          await delay(5000);
-          getQrcode = instance.qrCode;
+
+          // Polling com retry para aguardar geração do QR code
+          const maxAttempts = 30; // 15 segundos total (500ms * 30)
+          let attempts = 0;
+
+          while (attempts < maxAttempts) {
+            getQrcode = instance.qrCode;
+            if (getQrcode?.base64) {
+              // QR code gerado com sucesso
+              break;
+            }
+            await delay(500);
+            attempts++;
+          }
+
+          // Se não conseguiu gerar, pega o que tiver disponível
+          if (!getQrcode?.base64) {
+            getQrcode = instance.qrCode;
+          }
         }
 
         const result = {
