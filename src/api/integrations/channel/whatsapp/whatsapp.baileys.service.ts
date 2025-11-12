@@ -243,8 +243,12 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly sessionErrorCache: Map<string, { count: number; lastError: number }> = new Map();
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
-  private presenceInterval: NodeJS.Timeout | null = null;
   private lastActivity: number = Date.now();
+
+  // Settings cache - Background refresh to avoid blocking event loop
+  private settingsCache: any = null;
+  private settingsCacheInterval: NodeJS.Timeout | null = null;
+  private readonly SETTINGS_CACHE_REFRESH_INTERVAL = 60000; // 1 minute - refresh in background
 
   // Event listener callbacks stored for cleanup
   private wsCallListener: ((packet: any) => void) | null = null;
@@ -433,7 +437,6 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
-    this.stopPresenceManager();
     this.cleanupEventListeners();
     this.messageProcessor.onDestroy();
     await this.client?.logout('Log out instance: ' + this.instanceName);
@@ -446,10 +449,45 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  private stopPresenceManager() {
-    if (this.presenceInterval) {
-      clearInterval(this.presenceInterval);
-      this.presenceInterval = null;
+
+  /**
+   * Starts background settings cache refresh to avoid blocking event loop
+   * Critical for high-volume instances to prevent message loss
+   */
+  private async startSettingsCacheRefresh() {
+    // Stop any existing interval
+    this.stopSettingsCacheRefresh();
+
+    // Initial cache load
+    try {
+      this.settingsCache = await this.findSettings();
+      this.logger.verbose('Settings cache initialized');
+    } catch (error) {
+      this.logger.error('Failed to initialize settings cache:');
+      this.logger.error(error);
+      this.settingsCache = null;
+    }
+
+    // Refresh cache in background every minute
+    this.settingsCacheInterval = setInterval(async () => {
+      try {
+        this.settingsCache = await this.findSettings();
+        this.logger.verbose('Settings cache refreshed');
+      } catch (error) {
+        this.logger.warn('Failed to refresh settings cache (using stale cache):');
+        this.logger.warn(error);
+        // Keep using old cache on error
+      }
+    }, this.SETTINGS_CACHE_REFRESH_INTERVAL);
+  }
+
+  /**
+   * Stops background settings cache refresh
+   */
+  private stopSettingsCacheRefresh() {
+    if (this.settingsCacheInterval) {
+      clearInterval(this.settingsCacheInterval);
+      this.settingsCacheInterval = null;
     }
   }
 
@@ -483,6 +521,10 @@ export class BaileysStartupService extends ChannelStartupService {
       // Clear cache maps with size limits
       this.messageStubRetryCache.clear();
       this.sessionErrorCache.clear();
+
+      // Stop settings cache refresh and clear cache
+      this.stopSettingsCacheRefresh();
+      this.settingsCache = null;
     } catch (error) {
       this.logger.warn('Error during event listener cleanup:');
       this.logger.warn(error);
@@ -518,26 +560,6 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  private startPresenceManager() {
-    // Stop any existing interval
-    this.stopPresenceManager();
-
-    // Only start if alwaysOnline is disabled
-    if (!this.localSettings.alwaysOnline) {
-      // Mark as unavailable every 1 minute to ensure notifications on phone
-      this.presenceInterval = setInterval(async () => {
-        try {
-          if (this.client && this.stateConnection.state === 'open') {
-            await this.client.sendPresenceUpdate('unavailable');
-            this.logger.verbose('Auto-marked presence as unavailable to allow notifications');
-          }
-        } catch (error) {
-          this.logger.warn('Failed to update presence automatically:');
-          this.logger.warn(error);
-        }
-      }, 1 * 60 * 1000); // 1 minute
-    }
-  }
 
   private markActivity() {
     this.lastActivity = Date.now();
@@ -675,9 +697,6 @@ export class BaileysStartupService extends ChannelStartupService {
         this.clientReadyTimeout = null;
       }
 
-      // Stop presence manager immediately when closing
-      this.stopPresenceManager();
-
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
@@ -793,9 +812,6 @@ export class BaileysStartupService extends ChannelStartupService {
         state: 'open', // Usar valor explícito
         statusReason: this.stateConnection.statusReason,
       });
-
-      // Start automatic presence manager
-      this.startPresenceManager();
 
       // Mark client as ready after all initialization is complete
       // Small delay to ensure all async operations are done
@@ -958,7 +974,7 @@ export class BaileysStartupService extends ChannelStartupService {
       generateHighQualityLinkPreview: true,
       getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
       ...browserOptions,
-      markOnlineOnConnect: this.localSettings.alwaysOnline,
+      markOnlineOnConnect: false, // FORÇADO: Bot nunca deve aparecer como online
       retryRequestDelayMs: 1000, // AUMENTADO: 350ms -> 1000ms para maior estabilidade
       maxMsgRetryCount: 6, // AUMENTADO: 4 -> 6 tentativas para maior confiabilidade
       fireInitQueries: false, // DESABILITADO: Evita sincronizações automáticas que bloqueiam mensagens em tempo real
@@ -1012,10 +1028,10 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.info('Cleaning up old client before creating new connection...');
 
       try {
-        // Step 1: Stop presence manager
-        this.stopPresenceManager();
+        // Step 1: Stop settings cache refresh
+        this.stopSettingsCacheRefresh();
 
-        // Step 1.5: Clear any pending clientReady timeout
+        // Step 1.6: Clear any pending clientReady timeout
         if (this.clientReadyTimeout) {
           clearTimeout(this.clientReadyTimeout);
           this.clientReadyTimeout = null;
@@ -1084,6 +1100,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // Setup WebSocket event listeners with error handling
     this.setupWebSocketListeners();
+
+    // Start background settings cache refresh (critical for high-volume)
+    await this.startSettingsCacheRefresh();
 
     this.phoneNumber = number;
 
@@ -2150,23 +2169,14 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler() {
-    // Cache settings to avoid database query on every event (performance critical)
-    let settingsCache: any = null;
-    let settingsCacheTime = 0;
-    const SETTINGS_CACHE_TTL = 30000; // 30 seconds
-
+    // IMPORTANT: Settings are now cached in background to NEVER block event processing
+    // This prevents message loss in high-volume scenarios
     this.client.ev.process(async (events) => {
       if (!this.endSession) {
         const database = this.configService.get<Database>('DATABASE');
 
-        // Use cached settings or fetch if expired (avoid blocking event processing)
-        const now = Date.now();
-        if (!settingsCache || (now - settingsCacheTime) > SETTINGS_CACHE_TTL) {
-          settingsCache = await this.findSettings();
-          settingsCacheTime = now;
-          this.logger.verbose('Settings cache refreshed');
-        }
-        const settings = settingsCache;
+        // Use background-refreshed cache - NEVER await here to avoid blocking
+        const settings = this.settingsCache;
 
         if (events.call) {
           const call = events.call[0];
@@ -2811,6 +2821,11 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       const { number } = data;
 
+      // BLOQUEIO: Bot nunca deve aparecer como disponível/online
+      if (data?.presence === 'available') {
+        throw new BadRequestException('Bot cannot be marked as available/online. Use composing, recording, or paused instead.');
+      }
+
       const isWA = (await this.whatsappNumber({ numbers: [number] }))?.shift();
 
       if (!isWA.exists && !isJidGroup(isWA.jid) && !isWA.jid.includes('@broadcast')) {
@@ -2861,6 +2876,11 @@ export class BaileysStartupService extends ChannelStartupService {
   // Presence Controller
   public async setPresence(data: SetPresenceDto) {
     try {
+      // BLOQUEIO: Bot nunca deve aparecer como disponível/online
+      if (data?.presence === 'available') {
+        throw new BadRequestException('Bot cannot be marked as available/online. Use composing, recording, paused, or unavailable instead.');
+      }
+
       await this.client.sendPresenceUpdate(data.presence);
 
       return { presence: data.presence };
