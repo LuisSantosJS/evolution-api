@@ -7,6 +7,7 @@
   "scripts": {
     "build": "tsc --noEmit && tsup",
     "start": "tsx ./src/main.ts",
+    "push":"docker build --platform linux/amd64 -t luissantostsx/evolution-api:latest . && docker push luissantostsx/evolution-api:latest",
     "start:prod": "node dist/main",
     "dev:server": "tsx watch ./src/main.ts",
     "test": "tsx watch ./test/all.test.ts",
