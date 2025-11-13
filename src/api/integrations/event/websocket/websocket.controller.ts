@@ -65,35 +65,8 @@ export class WebsocketController extends EventController implements EventControl
       },
     });
 
-    this.socket.on('connection', async (socket) => {
+    this.socket.on('connection', (socket) => {
       this.logger.info('User connected');
-
-      // Enviar estado atual de todas as instâncias para o cliente que acabou de conectar
-      try {
-        const instanceNames = Object.keys(this.waMonitor.waInstances);
-        for (const instanceName of instanceNames) {
-          const instance = this.waMonitor.waInstances[instanceName];
-          if (instance) {
-            const state = instance.stateConnection?.state || instance.connectionStatus?.state || 'close';
-            const isReady = typeof instance.isConnectionReady === 'function' ? instance.isConnectionReady() : false;
-
-            // Enviar estado atual via socket específico da instância
-            this.socket.of(`/${instanceName}`).emit('connection.update', {
-              event: 'connection.update',
-              instance: instanceName,
-              data: {
-                state: state,
-                statusReason: instance.stateConnection?.statusReason,
-                isReady: isReady,
-              },
-              date_time: new Date().toISOString(),
-            });
-          }
-        }
-      } catch (error) {
-        this.logger.error('Error sending initial connection states:');
-        this.logger.error(error);
-      }
 
       socket.on('disconnect', () => {
         this.logger.info('User disconnected');
