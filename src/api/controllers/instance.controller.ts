@@ -149,8 +149,8 @@ export class InstanceController {
         if (instanceData.qrcode && instanceData.integration === Integration.WHATSAPP_BAILEYS) {
           await instance.connectToWhatsapp(instanceData.number);
 
-          // Polling com retry para aguardar geração do QR code
-          const maxAttempts = 30; // 15 segundos total (500ms * 30)
+          // Polling com retry para aguardar geração do QR code (5 segundos)
+          const maxAttempts = 10; // 5 segundos total (500ms * 10)
           let attempts = 0;
 
           while (attempts < maxAttempts) {
@@ -163,10 +163,8 @@ export class InstanceController {
             attempts++;
           }
 
-          // Se não conseguiu gerar, pega o que tiver disponível
-          if (!getQrcode?.base64) {
-            getQrcode = instance.qrCode;
-          }
+          // Se não conseguiu gerar, retorna o que tiver disponível
+          getQrcode = instance.qrCode;
         }
 
         const result = {
@@ -327,33 +325,64 @@ export class InstanceController {
       }
 
       if (state == 'connecting') {
+        // Opção C: Polling curto + forçar reconnect se necessário
+        // Fase 1: Polling inicial (5 segundos)
+        const maxAttempts = 10; // 5 segundos total (500ms * 10)
+        let attempts = 0;
+        let qrCode: wa.QrCode;
+
+        while (attempts < maxAttempts) {
+          qrCode = instance.qrCode;
+          if (qrCode?.base64) {
+            // QR code gerado com sucesso
+            return qrCode;
+          }
+          await delay(500);
+          attempts++;
+        }
+
+        // Fase 2: Se não gerou QR code, forçar reconnect
+        this.logger.warn(`QR code not generated after ${maxAttempts * 500}ms, forcing reconnect...`);
+        await instance.connectToWhatsapp(number);
+
+        // Fase 3: Polling pós-reconnect (3 segundos)
+        const postReconnectAttempts = 6; // 3 segundos total (500ms * 6)
+        attempts = 0;
+
+        while (attempts < postReconnectAttempts) {
+          qrCode = instance.qrCode;
+          if (qrCode?.base64) {
+            // QR code gerado com sucesso após reconnect
+            return qrCode;
+          }
+          await delay(500);
+          attempts++;
+        }
+
+        // Se ainda não conseguiu, retorna o que tiver
         return instance.qrCode;
       }
 
       if (state == 'close') {
         await instance.connectToWhatsapp(number);
 
-        // Polling com retry para aguardar geração do QR code
-        const maxAttempts = 30; // 15 segundos total (500ms * 30)
+        // Polling com retry para aguardar geração do QR code (5 segundos)
+        const maxAttempts = 10; // 5 segundos total (500ms * 10)
         let attempts = 0;
-        let qrCode;
+        let qrCode: wa.QrCode;
 
         while (attempts < maxAttempts) {
           qrCode = instance.qrCode;
           if (qrCode?.base64) {
             // QR code gerado com sucesso
-            break;
+            return qrCode;
           }
           await delay(500);
           attempts++;
         }
 
-        // Se não conseguiu gerar, pega o que tiver disponível
-        if (!qrCode?.base64) {
-          qrCode = instance.qrCode;
-        }
-
-        return qrCode;
+        // Se não conseguiu gerar, retorna o que tiver disponível
+        return instance.qrCode;
       }
 
       return {

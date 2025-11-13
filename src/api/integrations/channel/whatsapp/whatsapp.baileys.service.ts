@@ -698,6 +698,63 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+
+      // Tratamento especial para erro 428 ANTES da lógica de reconnect
+      if (statusCode === 428) {
+        this.logger.warn('Error 428 detected - "Can\'t link new devices". Clearing session and generating new QR code...');
+
+        // Atualizar status para 'close' primeiro
+        await this.updateConnectionStatus('close', {
+          disconnectionAt: new Date(),
+          disconnectionReasonCode: statusCode,
+          disconnectionObject: JSON.stringify(lastDisconnect),
+        });
+
+        // Fechar conexão antiga
+        this.client?.ws?.close();
+        this.client?.end(new Error('Error 428 - Resetting session'));
+
+        // Deletar sessão antiga do banco de dados
+        try {
+          const sessionExists = await this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } });
+          if (sessionExists) {
+            await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
+            this.logger.info('Old session deleted from database');
+          }
+        } catch (error) {
+          this.logger.error(`Error deleting session: ${error.message}`);
+        }
+
+        // Resetar contador de QR code
+        this.instance.qrcode = { count: 0, pairingCode: null, code: null, base64: null };
+
+        // Enviar webhook informando que nova sessão será criada
+        this.sendDataWebhook(Events.STATUS_INSTANCE, {
+          instance: this.instance.name,
+          status: 'generating_new_qrcode',
+          message: 'Error 428 - Generating new QR code',
+          disconnectionReasonCode: statusCode,
+        });
+
+        // Aguardar 2 segundos para garantir limpeza completa
+        await delay(2000);
+
+        // Gerar novo QR code (será enviado via webhook automaticamente no connectionUpdate)
+        try {
+          await this.connectToWhatsapp(this.phoneNumber);
+          this.logger.info('New QR code generation initiated');
+        } catch (error) {
+          this.logger.error(`Error generating new QR code: ${error.message}`);
+        }
+
+        return; // Sai aqui e não continua processando
+      }
+
+      // Códigos que NÃO devem reconnectar automaticamente:
+      // - loggedOut: usuário fez logout manualmente
+      // - forbidden: conta banida/bloqueada pelo WhatsApp
+      // - 402: Payment Required (conta com problemas de pagamento)
+      // - 406: Not Acceptable (versão incompatível)
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
 
@@ -730,6 +787,7 @@ export class BaileysStartupService extends ChannelStartupService {
           disconnectionObject: JSON.stringify(lastDisconnect),
         });
       } else {
+        // Código padrão para erros que não devem reconnectar
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
           status: 'closed',
