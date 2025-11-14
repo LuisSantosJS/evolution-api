@@ -43,39 +43,15 @@ export class WAMonitoringService {
   private instanceDeletionTimeouts: Map<string, NodeJS.Timeout> = new Map();
 
   public delInstanceTime(instance: string) {
-    // Clear any existing timeout for this instance
-    this.clearInstanceDeletionTimeout(instance);
-
-    const time = this.configService.get<DelInstance>('DEL_INSTANCE');
-    if (typeof time === 'number' && time > 0) {
-      const timeoutId = setTimeout(
-        async () => {
-          this.instanceDeletionTimeouts.delete(instance);
-          if (this.waInstances[instance]?.connectionStatus?.state !== 'open') {
-            if (this.waInstances[instance]?.connectionStatus?.state === 'connecting') {
-              if ((await this.waInstances[instance].integration) === Integration.WHATSAPP_BAILEYS) {
-                await this.waInstances[instance]?.client?.logout('Log out instance: ' + instance);
-                this.waInstances[instance]?.client?.ws?.close();
-                this.waInstances[instance]?.client?.end(undefined);
-              }
-              this.eventEmitter.emit('remove.instance', instance, 'inner');
-            } else {
-              this.eventEmitter.emit('remove.instance', instance, 'inner');
-            }
-          }
-        },
-        1000 * 60 * time,
-      );
-      this.instanceDeletionTimeouts.set(instance, timeoutId);
-    }
+    // DEL_INSTANCE timeout disabled - instances will not be automatically removed due to inactivity
+    // This function is kept for compatibility but does nothing
+    return;
   }
 
   public clearInstanceDeletionTimeout(instance: string) {
-    const timeoutId = this.instanceDeletionTimeouts.get(instance);
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-      this.instanceDeletionTimeouts.delete(instance);
-    }
+    // DEL_INSTANCE timeout disabled - no timeouts to clear
+    // This function is kept for compatibility but does nothing
+    return;
   }
 
   public async instanceInfo(instanceNames?: string[]): Promise<any> {
