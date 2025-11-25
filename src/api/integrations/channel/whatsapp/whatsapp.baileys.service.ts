@@ -1665,8 +1665,11 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
+          // Normaliza o remoteJid para evitar duplicação
+          const normalizedRemoteJid = this.normalizeRemoteJid(received.key) || received.key.remoteJid;
+
           const existingChat = await this.prismaRepository.chat.findFirst({
-            where: { instanceId: this.instanceId, remoteJid: received.key.remoteJid },
+            where: { instanceId: this.instanceId, remoteJid: normalizedRemoteJid },
             select: { id: true, name: true },
           });
 
@@ -1858,14 +1861,17 @@ export class BaileysStartupService extends ChannelStartupService {
             pushName: messageRaw.pushName,
           });
 
+          // Normaliza o remoteJid para evitar duplicação de contatos
+          const normalizedContactJid = this.normalizeRemoteJid(received.key) || received.key.remoteJid;
+
           const contact = await this.prismaRepository.contact.findFirst({
-            where: { remoteJid: received.key.remoteJid, instanceId: this.instanceId },
+            where: { remoteJid: normalizedContactJid, instanceId: this.instanceId },
           });
 
           const contactRaw: { remoteJid: string; pushName: string; profilePicUrl?: string; instanceId: string } = {
-            remoteJid: received.key.remoteJid,
+            remoteJid: normalizedContactJid,
             pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
-            profilePicUrl: (await this.profilePicture(received.key.remoteJid)).profilePictureUrl,
+            profilePicUrl: (await this.profilePicture(normalizedContactJid)).profilePictureUrl,
             instanceId: this.instanceId,
           };
 
@@ -4953,12 +4959,74 @@ export class BaileysStartupService extends ChannelStartupService {
     throw new Error('Method not available in the Baileys service');
   }
 
+  /**
+   * Normaliza o remoteJid para sempre usar o número real (@s.whatsapp.net)
+   * Isso evita duplicação de conversas quando mensagens vêm pelo LID e são enviadas pelo número real
+   */
+  private normalizeRemoteJid(key: any): string | null {
+    // Validação inicial: verifica se key existe
+    if (!key) {
+      this.logger.warn('[normalizeRemoteJid] Key is null or undefined');
+      return null;
+    }
+
+    const remoteJid = key?.remoteJid;
+    const remoteJidAlt = key?.remoteJidAlt;
+
+    // Se não tem nenhum, retorna null
+    if (!remoteJid && !remoteJidAlt) {
+      this.logger.warn('[normalizeRemoteJid] No remoteJid found in key');
+      return null;
+    }
+
+    // Para grupos e broadcast, mantém o remoteJid original
+    // Verifica se remoteJid é string antes de chamar funções do Baileys
+    if (remoteJid && typeof remoteJid === 'string' && (isJidGroup(remoteJid) || isJidBroadcast(remoteJid))) {
+      return remoteJid;
+    }
+
+    // Para LID users, SEMPRE usa o número real (remoteJidAlt) se disponível
+    if (remoteJid && typeof remoteJid === 'string' && isLidUser(remoteJid)) {
+      if (remoteJidAlt && typeof remoteJidAlt === 'string' && remoteJidAlt.includes('@s.whatsapp.net')) {
+        this.logger.debug(`[normalizeRemoteJid] LID to real number: ${remoteJid} -> ${remoteJidAlt}`);
+        return remoteJidAlt;
+      }
+      this.logger.warn(`[normalizeRemoteJid] LID without remoteJidAlt: ${remoteJid}`);
+      return remoteJid; // Fallback para LID se não tiver alternativa
+    }
+
+    // Para usuários PN (Phone Number), usa o número real se disponível
+    if (remoteJid && typeof remoteJid === 'string' && isPnUser(remoteJid)) {
+      if (remoteJidAlt && typeof remoteJidAlt === 'string' && remoteJidAlt.includes('@s.whatsapp.net')) {
+        this.logger.debug(`[normalizeRemoteJid] PN to real number: ${remoteJid} -> ${remoteJidAlt}`);
+        return remoteJidAlt;
+      }
+    }
+
+    // Se remoteJidAlt tem número real, prioriza ele
+    if (remoteJidAlt && typeof remoteJidAlt === 'string' && remoteJidAlt.includes('@s.whatsapp.net')) {
+      this.logger.debug(`[normalizeRemoteJid] Using remoteJidAlt: ${remoteJidAlt}`);
+      return remoteJidAlt;
+    }
+
+    // Fallback para remoteJid
+    return remoteJid || remoteJidAlt;
+  }
+
   private prepareMessage(message: proto.IWebMessageInfo): any {
     const contentType = getContentType(message.message);
     const contentMsg = message?.message[contentType] as any;
 
+    // Normaliza o remoteJid para evitar duplicação de conversas
+    // Protege contra message.key null/undefined
+    const normalizedRemoteJid = this.normalizeRemoteJid(message.key);
+    const normalizedKey = {
+      ...message.key,
+      remoteJid: normalizedRemoteJid || message.key?.remoteJid || 'unknown',
+    };
+
     const messageRaw = {
-      key: message.key,
+      key: normalizedKey,
       pushName:
         message.pushName ||
         (message.key.fromMe
@@ -5412,6 +5480,18 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     }
 
+    // Constrói filtro para remoteJid que busca tanto no remoteJid quanto no remoteJidAlt
+    // Valida que remoteJid é uma string não vazia antes de criar o filtro
+    const remoteJidFilter =
+      keyFilters?.remoteJid && typeof keyFilters.remoteJid === 'string' && keyFilters.remoteJid.trim().length > 0
+        ? {
+            OR: [
+              { key: { path: ['remoteJid'], equals: keyFilters.remoteJid } },
+              { key: { path: ['remoteJidAlt'], equals: keyFilters.remoteJid } },
+            ],
+          }
+        : {};
+
     const count = await this.prismaRepository.message.count({
       where: {
         instanceId: this.instanceId,
@@ -5419,10 +5499,10 @@ export class BaileysStartupService extends ChannelStartupService {
         source: query?.where?.source,
         messageType: query?.where?.messageType,
         ...timestampFilter,
+        ...remoteJidFilter,
         AND: [
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
           keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
           keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
         ],
       },
@@ -5443,10 +5523,10 @@ export class BaileysStartupService extends ChannelStartupService {
         source: query?.where?.source,
         messageType: query?.where?.messageType,
         ...timestampFilter,
+        ...remoteJidFilter,
         AND: [
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
           keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
           keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
         ],
       },

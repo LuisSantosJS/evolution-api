@@ -605,6 +605,18 @@ export class ChannelStartupService {
       }
     }
 
+    // Constrói filtro para remoteJid que busca tanto no remoteJid quanto no remoteJidAlt
+    // Valida que remoteJid é uma string não vazia antes de criar o filtro
+    const remoteJidFilter =
+      keyFilters?.remoteJid && typeof keyFilters.remoteJid === 'string' && keyFilters.remoteJid.trim().length > 0
+        ? {
+            OR: [
+              { key: { path: ['remoteJid'], equals: keyFilters.remoteJid } },
+              { key: { path: ['remoteJidAlt'], equals: keyFilters.remoteJid } },
+            ],
+          }
+        : {};
+
     const count = await this.prismaRepository.message.count({
       where: {
         instanceId: this.instanceId,
@@ -612,10 +624,10 @@ export class ChannelStartupService {
         source: query?.where?.source,
         messageType: query?.where?.messageType,
         ...timestampFilter,
+        ...remoteJidFilter,
         AND: [
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
           keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
           keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
         ],
       },
@@ -636,10 +648,10 @@ export class ChannelStartupService {
         source: query?.where?.source,
         messageType: query?.where?.messageType,
         ...timestampFilter,
+        ...remoteJidFilter,
         AND: [
           keyFilters?.id ? { key: { path: ['id'], equals: keyFilters?.id } } : {},
           keyFilters?.fromMe ? { key: { path: ['fromMe'], equals: keyFilters?.fromMe } } : {},
-          keyFilters?.remoteJid ? { key: { path: ['remoteJid'], equals: keyFilters?.remoteJid } } : {},
           keyFilters?.participants ? { key: { path: ['participants'], equals: keyFilters?.participants } } : {},
         ],
       },
@@ -697,21 +709,60 @@ export class ChannelStartupService {
   }
 
   public async findChatByRemoteJid(remoteJid: string) {
-    if (!remoteJid) return null;
-    return await this.prismaRepository.chat.findFirst({
+    // Valida que remoteJid é uma string não vazia
+    if (!remoteJid || typeof remoteJid !== 'string' || remoteJid.trim().length === 0) {
+      return null;
+    }
+
+    // Busca tanto pelo remoteJid quanto por conversas que tenham esse número no remoteJidAlt (mensagens antigas com LID)
+    // Primeiro tenta buscar pelo remoteJid direto
+    let chat = await this.prismaRepository.chat.findFirst({
       where: {
         instanceId: this.instanceId,
         remoteJid: remoteJid,
       },
     });
+
+    // Se não encontrou, busca mensagens com esse remoteJidAlt e pega o remoteJid correspondente
+    if (!chat) {
+      try {
+        const messageWithAlt = await this.prismaRepository.message.findFirst({
+          where: {
+            instanceId: this.instanceId,
+            key: { path: ['remoteJidAlt'], equals: remoteJid },
+          },
+          select: { key: true },
+        });
+
+        if (messageWithAlt && messageWithAlt.key) {
+          const lidRemoteJid = (messageWithAlt.key as any)?.remoteJid;
+          if (lidRemoteJid && typeof lidRemoteJid === 'string') {
+            chat = await this.prismaRepository.chat.findFirst({
+              where: {
+                instanceId: this.instanceId,
+                remoteJid: lidRemoteJid,
+              },
+            });
+          }
+        }
+      } catch (error) {
+        // Se houver erro na busca alternativa, apenas loga mas não falha
+        this.logger.warn(`[findChatByRemoteJid] Error searching by remoteJidAlt: ${error.message}`);
+      }
+    }
+
+    return chat;
   }
 
   public async fetchChats(query: any) {
-    const remoteJid = query?.where?.remoteJid
-      ? query?.where?.remoteJid.includes('@')
-        ? query.where?.remoteJid
-        : createJid(query.where?.remoteJid)
-      : null;
+    // Valida e normaliza o remoteJid
+    let remoteJid = null;
+    if (query?.where?.remoteJid && typeof query.where.remoteJid === 'string') {
+      const rawJid = query.where.remoteJid.trim();
+      if (rawJid.length > 0) {
+        remoteJid = rawJid.includes('@') ? rawJid : createJid(rawJid);
+      }
+    }
 
     const where = {
       instanceId: this.instanceId,
@@ -769,7 +820,11 @@ export class ChannelStartupService {
         LEFT JOIN "Contact" ON "Contact"."remoteJid" = "Message"."key"->>'remoteJid' AND "Contact"."instanceId" = "Message"."instanceId"
         LEFT JOIN "Chat" ON "Chat"."remoteJid" = "Message"."key"->>'remoteJid' AND "Chat"."instanceId" = "Message"."instanceId"
         WHERE "Message"."instanceId" = ${this.instanceId}
-        ${remoteJid ? Prisma.sql`AND "Message"."key"->>'remoteJid' = ${remoteJid}` : Prisma.sql``}
+        ${
+          remoteJid
+            ? Prisma.sql`AND ("Message"."key"->>'remoteJid' = ${remoteJid} OR "Message"."key"->>'remoteJidAlt' = ${remoteJid})`
+            : Prisma.sql``
+        }
         ${timestampFilter}
         ORDER BY "Message"."key"->>'remoteJid', "Message"."messageTimestamp" DESC
       )
