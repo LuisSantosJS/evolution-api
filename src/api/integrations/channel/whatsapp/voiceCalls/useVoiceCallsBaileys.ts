@@ -1,4 +1,4 @@
-import { ConnectionState, WAConnectionState, WASocket } from 'baileys';
+import { ConnectionState, WAConnectionState, WASocket } from '@whiskeysockets/baileys';
 import { io, Socket } from 'socket.io-client';
 
 import { ClientToServerEvents, ServerToClientEvents } from './transport.type';
@@ -71,7 +71,7 @@ export const useVoiceCallsBaileys = async (
 
   socket.on('assertSessions', async (jids, force, callback) => {
     try {
-      const response = await baileys_sock.assertSessions(jids);
+      const response = await baileys_sock.assertSessions(jids, force);
 
       callback(response);
 

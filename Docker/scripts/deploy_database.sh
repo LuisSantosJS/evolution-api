@@ -1,5 +1,13 @@
 #!/bin/bash
 
+# Garantir que /tmp existe e tem permissões corretas para arquivos temporários do Baileys
+if [ ! -d "/tmp" ]; then
+    echo "Creating /tmp directory..."
+    mkdir -p /tmp
+fi
+chmod 1777 /tmp 2>/dev/null || echo "Warning: Could not set /tmp permissions (may require root)"
+echo "Temporary directory /tmp configured with permissions: $(ls -ld /tmp | awk '{print $1}')"
+
 source ./Docker/scripts/env_functions.sh
 
 if [ "$DOCKER_ENV" != "true" ]; then

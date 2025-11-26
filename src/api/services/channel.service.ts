@@ -14,7 +14,7 @@ import { Logger } from '@config/logger.config';
 import { NotFoundException } from '@exceptions';
 import { Contact, Message, Prisma } from '@prisma/client';
 import { createJid } from '@utils/createJid';
-import { WASocket } from 'baileys';
+import { WASocket } from '@whiskeysockets/baileys';
 import { isArray } from 'class-validator';
 import EventEmitter2 from 'eventemitter2';
 import { v4 } from 'uuid';

@@ -75,7 +75,6 @@ import {
   S3,
 } from '@config/env.config';
 import { BadRequestException, InternalServerErrorException, NotFoundException } from '@exceptions';
-import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
@@ -112,7 +111,6 @@ import makeWASocket, {
   isJidGroup,
   isJidNewsletter,
   isLidUser,
-  isPnUser,
   makeCacheableSignalKeyStore,
   MessageUpsertType,
   MessageUserReceiptUpdate,
@@ -128,9 +126,9 @@ import makeWASocket, {
   WAMessageKey,
   WAPresence,
   WASocket,
-} from 'baileys';
-import { Label } from 'baileys/lib/Types/Label';
-import { LabelAssociation } from 'baileys/lib/Types/LabelAssociation';
+} from '@whiskeysockets/baileys';
+import { Label } from '@whiskeysockets/baileys/lib/Types/Label';
+import { LabelAssociation } from '@whiskeysockets/baileys/lib/Types/LabelAssociation';
 import { spawn } from 'child_process';
 import { isArray, isBase64, isURL } from 'class-validator';
 import { randomBytes } from 'crypto';
@@ -154,6 +152,27 @@ import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 const groupMetadataCache = new CacheService(new CacheEngine(configService, 'groups').getEngine());
+
+// Configure ffmpeg path - try npm package first, fall back to system ffmpeg for Alpine Linux
+let ffmpegBinaryPath = '/usr/bin/ffmpeg'; // Default to system ffmpeg (installed via apk in Docker)
+try {
+  // Try to load the npm package (works on most platforms)
+  const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+  if (ffmpegInstaller?.path) {
+    ffmpegBinaryPath = ffmpegInstaller.path;
+  }
+} catch (error) {
+  // Npm package not available (e.g., Alpine Linux musl), use system ffmpeg
+  console.log('[FFmpeg] Using system ffmpeg at /usr/bin/ffmpeg (npm package not available)');
+}
+
+// Configure fluent-ffmpeg to use the correct binary
+ffmpeg.setFfmpegPath(ffmpegBinaryPath);
+
+// Helper function to check if a JID is a phone number user (compatibility with older Baileys versions)
+const isPnUser = (jid: string): boolean => {
+  return jid?.endsWith('@s.whatsapp.net') || false;
+};
 
 // Adicione a função getVideoDuration no início do arquivo
 async function getVideoDuration(input: Buffer | string | Readable): Promise<number> {
@@ -288,37 +307,46 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       // Verificação 1: Estado básico da conexão
       if (this.stateConnection.state !== 'open') {
-        this.logger.verbose(`Connection not ready: state is '${this.stateConnection.state}'`);
+        this.logger.warn(`[isConnectionReady] FAILED - Check 1: state is '${this.stateConnection.state}' (expected 'open')`);
         return false;
       }
 
       // Verificação 2: Cliente existe e não está marcado para encerramento
       if (!this.client || this.endSession) {
-        this.logger.verbose(`Connection not ready: client=${!!this.client}, endSession=${this.endSession}`);
+        this.logger.warn(`[isConnectionReady] FAILED - Check 2: client=${!!this.client}, endSession=${this.endSession}`);
         return false;
       }
 
-      // Verificação 3: WebSocket está conectado (readyState === 1 = OPEN)
-      if (!this.client.ws || (this.client.ws as any).readyState !== 1) {
-        this.logger.verbose(`Connection not ready: WebSocket readyState=${(this.client.ws as any)?.readyState ?? 'undefined'}`);
-        return false;
-      }
-
-      // Verificação 4: User ID está definido (autenticação completa)
+      // Verificação 3: User ID está definido (autenticação completa)
       if (!this.client.user || !this.client.user.id) {
-        this.logger.verbose(`Connection not ready: user not authenticated`);
+        this.logger.warn(`[isConnectionReady] FAILED - Check 3: user=${!!this.client.user}, userId=${this.client.user?.id ?? 'undefined'}`);
         return false;
       }
 
-      // Verificação 5: Flag de cliente pronto está ativada
+      // Verificação 4: Flag de cliente pronto está ativada
       if (!this.isClientReady) {
-        this.logger.verbose(`Connection not ready: client initialization not complete`);
+        this.logger.warn(`[isConnectionReady] FAILED - Check 4: isClientReady=${this.isClientReady} (client initialization not complete)`);
         return false;
       }
 
+      // Verificação 5 (opcional): WebSocket está conectado
+      // NOTA: Esta verificação é informativa mas não bloqueante, pois o Baileys
+      // pode encapsular o WebSocket de forma que o readyState não seja diretamente acessível
+      const wsReadyState = (this.client.ws as any)?.readyState;
+      if (this.client.ws && wsReadyState !== undefined && wsReadyState !== 1) {
+        // Se conseguimos ler o readyState e ele NÃO é OPEN (1), isso pode ser um problema
+        this.logger.warn(`[isConnectionReady] WARNING - WebSocket readyState=${wsReadyState} (not OPEN=1). States: 0=CONNECTING, 2=CLOSING, 3=CLOSED`);
+        // Apenas bloquear se o WebSocket está explicitamente CLOSING ou CLOSED
+        if (wsReadyState === 2 || wsReadyState === 3) {
+          this.logger.warn(`[isConnectionReady] FAILED - Check 5: WebSocket is closing or closed`);
+          return false;
+        }
+      }
+
+      this.logger.verbose(`[isConnectionReady] SUCCESS - All checks passed (wsReadyState=${wsReadyState ?? 'N/A'})`);
       return true;
-    } catch (error) {
-      this.logger.error(`Error checking connection readiness: ${error.message}`);
+    } catch (error: any) {
+      this.logger.error(`[isConnectionReady] ERROR: ${error?.message || error}`);
       return false;
     }
   }
@@ -3104,13 +3132,25 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const uploadStartTime = Date.now();
 
-        // Executar upload com verificação periódica
-        const prepareMedia = await prepareWAMessageMedia(
-          {
-            [type]: mediaInput,
-          } as any,
-          { upload: this.client.waUploadToServer },
-        );
+        // Executar upload com verificação periódica e tratamento de erro robusto
+        let prepareMedia: any;
+        try {
+          prepareMedia = await prepareWAMessageMedia(
+            {
+              [type]: mediaInput,
+            } as any,
+            { upload: this.client.waUploadToServer },
+          );
+        } catch (uploadError: any) {
+          // Tratar especificamente erros de arquivo temporário do Baileys
+          if (uploadError?.code === 'ENOENT' && uploadError?.path?.includes('-enc')) {
+            this.logger.error(`Baileys temporary file error: ${uploadError.message}`);
+            this.logger.error(`Attempted path: ${uploadError.path}`);
+            throw new Error('Media upload failed on all hosts');
+          }
+          // Re-lançar outros erros
+          throw uploadError;
+        }
 
         // Verificar se conexão ainda está ativa após upload
         if (!this.isConnectionReady()) {
@@ -3404,7 +3444,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     return new Promise<Buffer>((resolve, reject) => {
-      const ffmpegProcess = spawn(ffmpegPath.path, [
+      const ffmpegProcess = spawn(ffmpegBinaryPath, [
         '-i',
         'pipe:0',
         '-vn',
@@ -3515,7 +3555,7 @@ export class BaileysStartupService extends ChannelStartupService {
           reject(error);
         });
 
-        ffmpeg.setFfmpegPath(ffmpegPath.path);
+        ffmpeg.setFfmpegPath(ffmpegBinaryPath);
 
         let command = ffmpeg(inputAudioStream);
 
@@ -5205,8 +5245,8 @@ export class BaileysStartupService extends ChannelStartupService {
     return response;
   }
 
-  public async baileysAssertSessions(jids: string[]) {
-    const response = await this.client.assertSessions(jids);
+  public async baileysAssertSessions(jids: string[], force: boolean = false) {
+    const response = await this.client.assertSessions(jids, force);
 
     return response;
   }
@@ -5332,7 +5372,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // Force reassert sessions to establish new ones
     try {
-      await this.client.assertSessions(jids);
+      await this.client.assertSessions(jids, true);
       this.logger.info(`Reasserted sessions for ${jids.length} contacts`);
     } catch (error) {
       this.logger.warn('Failed to reassert sessions:');

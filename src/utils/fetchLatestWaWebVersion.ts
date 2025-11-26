@@ -1,5 +1,5 @@
 import axios, { AxiosRequestConfig } from 'axios';
-import { fetchLatestBaileysVersion, WAVersion } from 'baileys';
+import { fetchLatestBaileysVersion, WAVersion } from '@whiskeysockets/baileys';
 
 export const fetchLatestWaWebVersion = async (options: AxiosRequestConfig<{}>) => {
   try {
