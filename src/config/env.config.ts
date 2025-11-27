@@ -379,7 +379,7 @@ export class ConfigService {
           MESSAGE_UPDATE: process.env?.DATABASE_SAVE_MESSAGE_UPDATE === 'true',
           CONTACTS: process.env?.DATABASE_SAVE_DATA_CONTACTS === 'true',
           CHATS: process.env?.DATABASE_SAVE_DATA_CHATS === 'true',
-          HISTORIC: process.env?.DATABASE_SAVE_DATA_HISTORIC === 'true',
+          HISTORIC: true,
           LABELS: process.env?.DATABASE_SAVE_DATA_LABELS === 'true',
           IS_ON_WHATSAPP: process.env?.DATABASE_SAVE_IS_ON_WHATSAPP === 'true',
           IS_ON_WHATSAPP_DAYS: Number.parseInt(process.env?.DATABASE_SAVE_IS_ON_WHATSAPP_DAYS ?? '7'),

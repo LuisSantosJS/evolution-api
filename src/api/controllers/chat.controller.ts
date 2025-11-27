@@ -11,6 +11,7 @@ import {
   ProfileStatusDto,
   ReadMessageDto,
   SendPresenceDto,
+  SyncMessagesDto,
   UpdateMessageDto,
   WhatsAppNumberDto,
 } from '@api/dto/chat.dto';
@@ -112,5 +113,9 @@ export class ChatController {
 
   public async blockUser({ instanceName }: InstanceDto, data: BlockUserDto) {
     return await this.waMonitor.waInstances[instanceName].blockUser(data);
+  }
+
+  public async syncMessages({ instanceName }: InstanceDto, data: SyncMessagesDto) {
+    return await this.waMonitor.waInstances[instanceName].syncMessages(data);
   }
 }

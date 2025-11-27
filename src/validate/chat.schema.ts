@@ -185,6 +185,15 @@ export const blockUserSchema: JSONSchema7 = {
   ...isNotEmpty('number', 'status'),
 };
 
+export const syncMessagesSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    remoteJid: { type: 'string' },
+    limit: { type: 'integer', minimum: 1, maximum: 500 },
+  },
+};
+
 export const contactValidateSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',

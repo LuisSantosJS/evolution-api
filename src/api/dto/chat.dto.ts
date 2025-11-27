@@ -127,3 +127,8 @@ export class BlockUserDto {
   number: string;
   status: 'block' | 'unblock';
 }
+
+export class SyncMessagesDto {
+  remoteJid?: string;
+  limit?: number;
+}

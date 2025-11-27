@@ -12,6 +12,7 @@ import {
   ProfileStatusDto,
   ReadMessageDto,
   SendPresenceDto,
+  SyncMessagesDto,
   UpdateMessageDto,
   WhatsAppNumberDto,
 } from '@api/dto/chat.dto';
@@ -34,6 +35,7 @@ import {
   profileSchema,
   profileStatusSchema,
   readMessageSchema,
+  syncMessagesSchema,
   updateMessageSchema,
   whatsappNumberSchema,
 } from '@validate/validate.schema';
@@ -150,6 +152,16 @@ export class ChatRouter extends RouterBroker {
         });
 
         return res.status(HttpStatus.CREATED).json(response);
+      })
+      .post(this.routerPath('syncMessages'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<SyncMessagesDto>({
+          request: req,
+          schema: syncMessagesSchema,
+          ClassRef: SyncMessagesDto,
+          execute: (instance, data) => chatController.syncMessages(instance, data),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
       })
       .post(this.routerPath('findContacts'), ...guards, async (req, res) => {
         const response = await this.dataValidate<Query<Contact>>({

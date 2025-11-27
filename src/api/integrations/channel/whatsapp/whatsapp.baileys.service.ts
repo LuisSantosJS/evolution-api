@@ -12,6 +12,7 @@ import {
   PrivacySettingDto,
   ReadMessageDto,
   SendPresenceDto,
+  SyncMessagesDto,
   UpdateMessageDto,
   WhatsAppNumberDto,
 } from '@api/dto/chat.dto';
@@ -1465,6 +1466,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         const messagesRaw: any[] = [];
+        const messagesForEvent: any[] = []; // Collect all messages for webhook event
 
         const messagesRepository: Set<string> = new Set(
           chatwootImport.getRepositoryMessagesCache(instance) ??
@@ -1484,8 +1486,13 @@ export class BaileysStartupService extends ChannelStartupService {
           chatwootImport.setRepositoryMessagesCache(instance, messagesRepository);
         }
 
+        let skippedNoData = 0;
+        let skippedChatwootDate = 0;
+        let skippedDuplicate = 0;
+
         for (const m of messages) {
           if (!m.message || !m.key || !m.messageTimestamp) {
+            skippedNoData++;
             continue;
           }
 
@@ -1500,13 +1507,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
           if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
             if (m.messageTimestamp <= timestampLimitToImport) {
+              skippedChatwootDate++;
               continue;
             }
           }
 
-          if (messagesRepository?.has(m.key.id)) {
-            continue;
-          }
+          const isMessageInRepository = messagesRepository?.has(m.key.id);
 
           if (!m.pushName && !m.key.fromMe) {
             const participantJid = m.participant || m.key.participant || m.key.remoteJid;
@@ -1517,12 +1523,30 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          messagesRaw.push(this.prepareMessage(m));
+          const preparedMessage = this.prepareMessage(m);
+
+          // Always add to event array (for webhook)
+          messagesForEvent.push(preparedMessage);
+
+          // Only add to messagesRaw if it's a new message (for database save)
+          if (!isMessageInRepository) {
+            messagesRaw.push(preparedMessage);
+          } else {
+            skippedDuplicate++;
+          }
         }
 
-        this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw]);
+        console.log(
+          `Message sync stats: Total=${messages.length}, Event=${messagesForEvent.length}, New=${messagesRaw.length}, ` +
+          `Skipped: NoData=${skippedNoData}, ChatwootDate=${skippedChatwootDate}, Duplicate=${skippedDuplicate}`
+        );
 
-        if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
+        // Send webhook event with all messages (including duplicates)
+        if (messagesForEvent.length > 0) {
+          this.sendDataWebhook(Events.MESSAGES_SET, [...messagesForEvent]);
+        }
+
+        if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC && messagesRaw.length > 0) {
           await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
         }
 
@@ -4121,10 +4145,11 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async getLastMessage(number: string) {
-    const where: any = { key: { remoteJid: number }, instanceId: this.instance.id };
-
     const messages = await this.prismaRepository.message.findMany({
-      where,
+      where: {
+        instanceId: this.instanceId,
+        key: { path: ['remoteJid'], equals: number },
+      },
       orderBy: { messageTimestamp: 'desc' },
       take: 1,
     });
@@ -4133,13 +4158,7 @@ export class BaileysStartupService extends ChannelStartupService {
       throw new NotFoundException('Messages not found');
     }
 
-    let lastMessage = messages.pop();
-
-    for (const message of messages) {
-      if (message.messageTimestamp >= lastMessage.messageTimestamp) {
-        lastMessage = message;
-      }
-    }
+    const lastMessage = messages[0];
 
     return lastMessage as unknown as LastMessage;
   }
@@ -4557,6 +4576,193 @@ export class BaileysStartupService extends ChannelStartupService {
       return { block: 'success' };
     } catch (error) {
       throw new InternalServerErrorException('Error blocking user', error.toString());
+    }
+  }
+
+  private getValidRemoteJid(obj: any): string | null {
+    if (!obj) return null;
+
+    const remoteJid = obj.remoteJid;
+    const remoteJidAlt = obj.remoteJidAlt;
+    const senderPn = obj.senderPn;
+    const id = obj.id;
+
+    // Se remoteJid contém @s.whatsapp.net, usa ele
+    if (remoteJid && remoteJid.includes('@s.whatsapp.net')) {
+      return remoteJid;
+    }
+
+    // Se remoteJidAlt contém @s.whatsapp.net, usa ele
+    if (remoteJidAlt && remoteJidAlt.includes('@s.whatsapp.net')) {
+      return remoteJidAlt;
+    }
+
+    // Se senderPn contém @s.whatsapp.net, usa ele
+    if (senderPn && senderPn.includes('@s.whatsapp.net')) {
+      return senderPn;
+    }
+
+    // Se id contém @s.whatsapp.net, usa ele
+    if (id && id.includes('@s.whatsapp.net')) {
+      return id;
+    }
+
+    // Se nenhum contém @s.whatsapp.net, dá preferência ao remoteJid
+    if (remoteJid) {
+      return remoteJid;
+    }
+
+    // Se remoteJid não existe, usa remoteJidAlt
+    if (remoteJidAlt) {
+      return remoteJidAlt;
+    }
+
+    // Se remoteJidAlt não existe, usa senderPn
+    if (senderPn) {
+      return senderPn;
+    }
+
+    // Por último, usa id se disponível
+    if (id) {
+      return id;
+    }
+
+    return null;
+  }
+
+  public async syncMessages(data: SyncMessagesDto) {
+    const limit = data.limit || 100; // Default to 100 messages per chat
+
+    // If remoteJid is provided, sync only that chat
+    if (data.remoteJid) {
+      // Validate and get the correct remoteJid
+      const validatedNumbers = await this.whatsappNumber({ numbers: [data.remoteJid] });
+
+      if (!validatedNumbers || validatedNumbers.length === 0) {
+        throw new NotFoundException('Number not found or invalid');
+      }
+
+      const numberInfo = validatedNumbers[0];
+
+      // Check if number exists on WhatsApp
+      if (!numberInfo.exists) {
+        throw new NotFoundException(`Number ${data.remoteJid} is not on WhatsApp`);
+      }
+
+      // Skip groups
+      if (numberInfo.jid.includes('@g.us')) {
+        throw new BadRequestException('Groups are not supported for synchronization');
+      }
+
+      // Only accept @s.whatsapp.net
+      if (!numberInfo.jid.includes('@s.whatsapp.net')) {
+        throw new BadRequestException('Only individual chats are supported (@s.whatsapp.net)');
+      }
+
+      const validRemoteJid = numberInfo.jid;
+
+      // Process in background
+      this.syncSingleChat(validRemoteJid, limit).catch((error) => {
+        this.logger.error(`Background sync error for ${validRemoteJid}: ${error.toString()}`);
+      });
+
+      return {
+        success: true,
+        message: 'Synchronization started in background',
+        validatedNumber: validRemoteJid
+      };
+    }
+
+    // If no remoteJid provided, sync all individual chats
+    // Start background process and return immediately
+    this.syncRecentChats(limit).catch((error) => {
+      this.logger.error(`Background sync error: ${error.toString()}`);
+    });
+
+    return {
+      success: true,
+      message: 'Synchronization started in background for all individual chats'
+    };
+  }
+
+  private async syncSingleChat(remoteJid: string, limit: number): Promise<void> {
+    try {
+      // Get the last message from the chat to use as reference
+      const lastMessage = await this.getLastMessage(remoteJid);
+
+      if (!lastMessage || !lastMessage.key) {
+        this.logger.warn(`No messages found for chat: ${remoteJid}, skipping...`);
+        return;
+      }
+
+      // Request message history synchronization
+      await this.client.fetchMessageHistory(
+        limit,
+        lastMessage.key,
+        lastMessage.messageTimestamp
+      );
+
+      this.logger.info(`Successfully requested sync for chat: ${remoteJid} (${limit} messages)`);
+    } catch (error) {
+      const errorMessage = error?.message || error?.toString() || JSON.stringify(error);
+      this.logger.error(`Error syncing chat ${remoteJid}: ${errorMessage}`);
+    }
+  }
+
+  private async syncRecentChats(limit: number): Promise<void> {
+    try {
+      // Get all chats, ordered by most recent first
+      const recentChats = await this.prismaRepository.chat.findMany({
+        where: {
+          instanceId: this.instanceId,
+        },
+        select: {
+          remoteJid: true,
+          updatedAt: true,
+        },
+        orderBy: {
+          updatedAt: 'desc', // Most recent chats first
+        },
+      });
+
+      if (!recentChats || recentChats.length === 0) {
+        this.logger.warn('No chats found for this instance');
+        return;
+      }
+
+      // Filter only individual chats (@s.whatsapp.net), ignore groups
+      const individualChats = recentChats.filter((chat) => {
+        const validRemoteJid = this.getValidRemoteJid(chat);
+        return validRemoteJid && validRemoteJid.includes('@s.whatsapp.net');
+      });
+
+      if (individualChats.length === 0) {
+        this.logger.warn('No individual chats found');
+        return;
+      }
+
+      this.logger.info(
+        `Starting background synchronization for ${individualChats.length} individual chats (ignoring ${recentChats.length - individualChats.length} groups)`
+      );
+
+      // Process each chat
+      for (const chat of individualChats) {
+        const validRemoteJid = this.getValidRemoteJid(chat);
+
+        if (!validRemoteJid) {
+          this.logger.warn(`Invalid remoteJid for chat: ${chat.remoteJid}, skipping...`);
+          continue;
+        }
+
+        await this.syncSingleChat(validRemoteJid, limit);
+
+        // Add a small delay between requests to avoid overwhelming the server
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+
+      this.logger.info(`Background synchronization completed for ${individualChats.length} chats`);
+    } catch (error) {
+      this.logger.error(`Error in background sync: ${error.toString()}`);
     }
   }
 
