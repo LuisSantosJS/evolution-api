@@ -1773,7 +1773,8 @@ export class BaileysStartupService extends ChannelStartupService {
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             const msg = await this.prismaRepository.message.create({ data: messageRaw });
 
-            const { remoteJid } = received.key;
+            // IMPORTANTE: Usar o remoteJid normalizado que foi salvo, não o original
+            const { remoteJid } = messageRaw.key; // ✅ Pega do messageRaw (normalizado)
             const timestamp = msg.messageTimestamp;
 
             // Removed duplicate read message check - allowing all read messages to be processed
@@ -1942,7 +1943,48 @@ export class BaileysStartupService extends ChannelStartupService {
           }
         }
       } catch (error) {
-        this.logger.error(error);
+        // Log detalhado para debugging de perda de mensagens
+        this.logger.error(
+          `[messages.upsert] CRITICAL ERROR - Message processing failed: ${error.message}\n` +
+            `Stack: ${error.stack}\n` +
+            `InstanceId: ${this.instanceId}\n` +
+            `Timestamp: ${new Date().toISOString()}`,
+        );
+
+        // FAILSAFE: Tentar enviar evento com dados originais mesmo que tenha dado erro
+        try {
+          if (messages && messages.length > 0) {
+            this.logger.warn(`[messages.upsert] FAILSAFE: Sending ${messages.length} events with original data`);
+
+            for (const msg of messages) {
+              try {
+                // Prepara mensagem mínima com dados originais (sem normalização)
+                const fallbackMessage = {
+                  key: msg.key,
+                  pushName: msg.pushName || 'Unknown',
+                  message: msg.message || {},
+                  messageType: Object.keys(msg.message || {})[0] || 'unknown',
+                  messageTimestamp: msg.messageTimestamp || Date.now(),
+                  instanceId: this.instanceId,
+                  source: 'FAILSAFE',
+                };
+
+                // Envia evento mesmo com dados não processados
+                this.sendDataWebhook(Events.MESSAGES_UPSERT, fallbackMessage);
+
+                this.logger.info(`[messages.upsert] FAILSAFE: Event sent for message ${msg.key?.id}`);
+              } catch (failsafeError) {
+                this.logger.error(`[messages.upsert] FAILSAFE: Failed to send event: ${failsafeError.message}`);
+              }
+            }
+          }
+        } catch (outerError) {
+          this.logger.error(`[messages.upsert] FAILSAFE: Critical failure: ${outerError.message}`);
+        }
+
+        // IMPORTANTE: Não engolir o erro silenciosamente
+        // Descomentar linha abaixo em ambiente de desenvolvimento para ver erros:
+        // throw error;
       }
     },
 
@@ -5000,7 +5042,8 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   /**
-   * Normaliza o remoteJid para sempre usar o número real (@s.whatsapp.net)
+   * Normaliza o remoteJid para SEMPRE usar o número real (@s.whatsapp.net)
+   * Prioriza: remoteJidAlt > senderPn > remoteJid (se não for LID) > LID (último caso)
    * Isso evita duplicação de conversas quando mensagens vêm pelo LID e são enviadas pelo número real
    */
   private normalizeRemoteJid(key: any): string | null {
@@ -5012,45 +5055,56 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const remoteJid = key?.remoteJid;
     const remoteJidAlt = key?.remoteJidAlt;
+    const senderPn = key?.senderPn; // Número real do remetente (quando disponível)
 
     // Se não tem nenhum, retorna null
-    if (!remoteJid && !remoteJidAlt) {
+    if (!remoteJid && !remoteJidAlt && !senderPn) {
       this.logger.warn('[normalizeRemoteJid] No remoteJid found in key');
       return null;
     }
 
-    // Para grupos e broadcast, mantém o remoteJid original
-    // Verifica se remoteJid é string antes de chamar funções do Baileys
+    // Para grupos e broadcast, SEMPRE mantém o remoteJid original
     if (remoteJid && typeof remoteJid === 'string' && (isJidGroup(remoteJid) || isJidBroadcast(remoteJid))) {
       return remoteJid;
     }
 
-    // Para LID users, SEMPRE usa o número real (remoteJidAlt) se disponível
-    if (remoteJid && typeof remoteJid === 'string' && isLidUser(remoteJid)) {
-      if (remoteJidAlt && typeof remoteJidAlt === 'string' && remoteJidAlt.includes('@s.whatsapp.net')) {
-        this.logger.debug(`[normalizeRemoteJid] LID to real number: ${remoteJid} -> ${remoteJidAlt}`);
-        return remoteJidAlt;
-      }
-      this.logger.warn(`[normalizeRemoteJid] LID without remoteJidAlt: ${remoteJid}`);
-      return remoteJid; // Fallback para LID se não tiver alternativa
-    }
+    // ESTRATÉGIA: SEMPRE priorizar números reais (@s.whatsapp.net) sobre LID
 
-    // Para usuários PN (Phone Number), usa o número real se disponível
-    if (remoteJid && typeof remoteJid === 'string' && isPnUser(remoteJid)) {
-      if (remoteJidAlt && typeof remoteJidAlt === 'string' && remoteJidAlt.includes('@s.whatsapp.net')) {
-        this.logger.debug(`[normalizeRemoteJid] PN to real number: ${remoteJid} -> ${remoteJidAlt}`);
-        return remoteJidAlt;
-      }
-    }
-
-    // Se remoteJidAlt tem número real, prioriza ele
-    if (remoteJidAlt && typeof remoteJidAlt === 'string' && remoteJidAlt.includes('@s.whatsapp.net')) {
-      this.logger.debug(`[normalizeRemoteJid] Using remoteJidAlt: ${remoteJidAlt}`);
+    // PRIORIDADE 1: remoteJidAlt (se for número real)
+    if (remoteJidAlt && typeof remoteJidAlt === 'string' && isPnUser(remoteJidAlt)) {
+      this.logger.debug(`[normalizeRemoteJid] Using remoteJidAlt: ${remoteJid} -> ${remoteJidAlt}`);
       return remoteJidAlt;
     }
 
-    // Fallback para remoteJid
-    return remoteJid || remoteJidAlt;
+    // PRIORIDADE 2: senderPn (se for número real)
+    if (senderPn && typeof senderPn === 'string' && isPnUser(senderPn)) {
+      this.logger.debug(`[normalizeRemoteJid] Using senderPn: ${remoteJid} -> ${senderPn}`);
+      return senderPn;
+    }
+
+    // PRIORIDADE 3: remoteJid (se JÁ for número real, não LID)
+    if (remoteJid && typeof remoteJid === 'string' && isPnUser(remoteJid)) {
+      return remoteJid;
+    }
+
+    // PRIORIDADE 4: Se remoteJid é LID, tenta usar remoteJidAlt (qualquer formato)
+    if (remoteJid && typeof remoteJid === 'string' && isLidUser(remoteJid)) {
+      if (remoteJidAlt && typeof remoteJidAlt === 'string') {
+        this.logger.debug(`[normalizeRemoteJid] LID with alt: ${remoteJid} -> ${remoteJidAlt}`);
+        return remoteJidAlt;
+      }
+      // Fallback: usa LID se não tiver nenhuma alternativa
+      this.logger.warn(`[normalizeRemoteJid] LID without alternatives: ${remoteJid}`);
+      return remoteJid;
+    }
+
+    // PRIORIDADE 5: Usa remoteJid (outros formatos válidos)
+    if (remoteJid && typeof remoteJid === 'string') {
+      return remoteJid;
+    }
+
+    // Fallback final: remoteJidAlt (qualquer formato) ou null
+    return remoteJidAlt || null;
   }
 
   private prepareMessage(message: proto.IWebMessageInfo): any {
