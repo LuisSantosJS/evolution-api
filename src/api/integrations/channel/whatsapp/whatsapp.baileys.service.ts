@@ -257,7 +257,8 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private authStateProvider: AuthStateProvider;
-  private readonly msgRetryCounterCache: CacheStore = new NodeCache();
+  // Message retry counter cache - TTL of 60s to prevent stale counters after reconnection
+  private readonly msgRetryCounterCache: CacheStore = new NodeCache({ stdTTL: 60, useClones: false });
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private readonly messageStubRetryCache: Map<string, WAMessage> = new Map();
   private readonly sessionErrorCache: Map<string, { count: number; lastError: number }> = new Map();
@@ -270,6 +271,10 @@ export class BaileysStartupService extends ChannelStartupService {
   private settingsCacheInterval: NodeJS.Timeout | null = null;
   private readonly SETTINGS_CACHE_REFRESH_INTERVAL = 60000; // 1 minute - refresh in background
 
+  // Message processor health check
+  private streamHealthCheckInterval: NodeJS.Timeout | null = null;
+  private readonly STREAM_HEALTH_CHECK_INTERVAL = 30000; // 30 seconds - check if stream is alive
+
   // Event listener callbacks stored for cleanup
   private wsCallListener: ((packet: any) => void) | null = null;
   private wsCallAckListener: ((packet: any) => void) | null = null;
@@ -279,6 +284,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
   // Reconnection lock to prevent simultaneous reconnections
   private reconnectLock = false;
+  private reconnectAttempts = 0;
+  private readonly MAX_RECONNECT_DELAY = 30000; // Max 30 seconds
+  private readonly BASE_RECONNECT_DELAY = 2000; // Start with 2 seconds
   private isClientReady = false;
   private clientReadyTimeout: NodeJS.Timeout | null = null; // NOVO: Para limpar timeout
 
@@ -520,6 +528,49 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  /**
+   * Starts background health check for message processor stream
+   * Automatically recreates the stream if it dies
+   */
+  private startStreamHealthCheck() {
+    // Clear any existing interval
+    this.stopStreamHealthCheck();
+
+    this.streamHealthCheckInterval = setInterval(() => {
+      try {
+        if (!this.messageProcessor.isStreamHealthy()) {
+          const stats = this.messageProcessor.getStreamStats();
+          this.logger.error('Message processor stream is DEAD! Recreating...');
+          this.logger.error(`Stream stats before recreation: ${JSON.stringify(stats)}`);
+
+          // Recreate the message processor
+          this.messageProcessor.onDestroy();
+          this.messageProcessor = new BaileysMessageProcessor();
+          this.messageProcessor.mount({
+            onMessageReceive: this.messageHandle['messages.upsert'].bind(this),
+          });
+
+          this.logger.warn('Message processor stream RECREATED successfully');
+        }
+      } catch (error) {
+        this.logger.error('Error during stream health check:');
+        this.logger.error(error);
+      }
+    }, this.STREAM_HEALTH_CHECK_INTERVAL);
+
+    this.logger.verbose(`Stream health check started (interval: ${this.STREAM_HEALTH_CHECK_INTERVAL}ms)`);
+  }
+
+  /**
+   * Stops background stream health check
+   */
+  private stopStreamHealthCheck() {
+    if (this.streamHealthCheckInterval) {
+      clearInterval(this.streamHealthCheckInterval);
+      this.streamHealthCheckInterval = null;
+    }
+  }
+
   private cleanupEventListeners() {
     try {
       // Remove WebSocket event listeners
@@ -551,8 +602,9 @@ export class BaileysStartupService extends ChannelStartupService {
       this.messageStubRetryCache.clear();
       this.sessionErrorCache.clear();
 
-      // Stop settings cache refresh and clear cache
+      // Stop background intervals
       this.stopSettingsCacheRefresh();
+      this.stopStreamHealthCheck();
       this.settingsCache = null;
     } catch (error) {
       this.logger.warn('Error during event listener cleanup:');
@@ -738,7 +790,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
       if (shouldReconnect && !this.reconnectLock) {
         this.reconnectLock = true;
-        this.logger.info('Initiating reconnection with lock...');
+        this.reconnectAttempts++;
+
+        // Calculate exponential backoff delay: 2s, 4s, 8s, 16s, 30s (max)
+        const exponentialDelay = Math.min(
+          this.BASE_RECONNECT_DELAY * Math.pow(2, this.reconnectAttempts - 1),
+          this.MAX_RECONNECT_DELAY,
+        );
+
+        this.logger.info(
+          `Initiating reconnection with lock... (attempt #${this.reconnectAttempts}, delay: ${exponentialDelay}ms)`,
+        );
 
         // Atualizar status para 'close' atomicamente
         await this.updateConnectionStatus('close', {
@@ -748,11 +810,15 @@ export class BaileysStartupService extends ChannelStartupService {
         });
 
         try {
-          // Small delay to ensure clean state before reconnecting
-          await delay(1000);
+          // Exponential backoff delay to give WhatsApp server time to clear session state
+          // Critical for preventing "Bad MAC" and "MessageCounterError" after reconnection
+          await delay(exponentialDelay);
           await this.connectToWhatsapp(this.phoneNumber);
+
+          // Reset reconnect attempts on successful connection (will be set to 0 when connection opens)
         } catch (error) {
-          this.logger.error(`Reconnection failed: ${error.message}`);
+          this.logger.error(`Reconnection failed (attempt #${this.reconnectAttempts}): ${error.message}`);
+          // Don't reset attempts - let exponential backoff continue
         } finally {
           this.reconnectLock = false;
         }
@@ -830,6 +896,10 @@ export class BaileysStartupService extends ChannelStartupService {
         profileName: (await this.getProfileName()) as string,
         profilePicUrl: this.instance.profilePictureUrl,
       });
+
+      // Reset reconnect attempts counter on successful connection
+      this.reconnectAttempts = 0;
+      this.logger.verbose('Reconnection attempts counter reset');
 
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
         this.chatwootService.eventWhatsapp(
@@ -1064,8 +1134,9 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.info('Cleaning up old client before creating new connection...');
 
       try {
-        // Step 1: Stop settings cache refresh
+        // Step 1: Stop background intervals
         this.stopSettingsCacheRefresh();
+        this.stopStreamHealthCheck();
 
         // Step 1.6: Clear any pending clientReady timeout
         if (this.clientReadyTimeout) {
@@ -1109,6 +1180,12 @@ export class BaileysStartupService extends ChannelStartupService {
         });
         this.logger.verbose('Message processor reset');
 
+        // Step 6.5: Clear message retry counter cache to prevent "Key used already" errors
+        // This is CRITICAL: after reconnection, WhatsApp server resets message counters
+        // but our cache still has old counters, causing MessageCounterError
+        this.msgRetryCounterCache.flushAll();
+        this.logger.verbose('Message retry counter cache cleared');
+
         // Step 7: Clear client reference
         this.client = null;
 
@@ -1139,6 +1216,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // Start background settings cache refresh (critical for high-volume)
     await this.startSettingsCacheRefresh();
+
+    // Start background stream health check (prevents message loss)
+    this.startStreamHealthCheck();
 
     this.phoneNumber = number;
 
@@ -1583,12 +1663,13 @@ export class BaileysStartupService extends ChannelStartupService {
         this.markActivity();
 
         // Log message type for diagnostics
-        this.logger.verbose(`messages.upsert received: type=${type}, count=${messages.length}`);
+        this.logger.verbose(`messages.upsert received: type=${type}, count=${messages.length}, requestId=${requestId}`);
 
         // Only process 'notify' and 'append' types (real-time messages)
         // Note: History sync comes through 'messaging-history.set' event, not 'messages.upsert'
+        // HOWEVER: In some Baileys versions, fetchMessageHistory might send messages through messages.upsert
         if (type !== 'notify' && type !== 'append') {
-          this.logger.verbose(`Ignoring messages with type: ${type}`);
+          this.logger.warn(`Ignoring messages with type: ${type}, count=${messages.length}. First message remoteJid: ${messages[0]?.key?.remoteJid}`);
           return;
         }
 
@@ -2280,6 +2361,12 @@ export class BaileysStartupService extends ChannelStartupService {
     // This prevents message loss in high-volume scenarios
     this.client.ev.process(async (events) => {
       if (!this.endSession) {
+        // Debug: Log all event keys to help diagnose missing events
+        const eventKeys = Object.keys(events).filter(key => events[key]);
+        if (eventKeys.length > 0) {
+          this.logger.verbose(`Events received: ${eventKeys.join(', ')}`);
+        }
+
         const database = this.configService.get<Database>('DATABASE');
 
         // Use background-refreshed cache - NEVER await here to avoid blocking
@@ -2311,6 +2398,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (events['messaging-history.set']) {
           const payload = events['messaging-history.set'];
+          this.logger.verbose(`messaging-history.set event received: ${payload.messages?.length || 0} messages, syncType: ${payload.syncType}`);
           // Process async to not block realtime events
           this.messageHandle['messaging-history.set'](payload).catch((error) => {
             this.logger.error('Error processing messaging-history.set:');
@@ -4695,17 +4783,62 @@ export class BaileysStartupService extends ChannelStartupService {
         return;
       }
 
-      // Request message history synchronization
-      await this.client.fetchMessageHistory(
+      // Request message history synchronization from Baileys
+      this.logger.verbose(`Requesting message history for ${remoteJid}: limit=${limit}, timestamp=${lastMessage.messageTimestamp}`);
+
+      const syncResult = await this.client.fetchMessageHistory(
         limit,
         lastMessage.key,
         lastMessage.messageTimestamp
       );
 
-      this.logger.info(`Successfully requested sync for chat: ${remoteJid} (${limit} messages)`);
+      this.logger.info(`Successfully requested sync for chat: ${remoteJid} (${limit} messages), syncId: ${syncResult || 'none'}`);
+
+      // FALLBACK: Also fetch messages from database and send to webhook
+      // This ensures messages are sent even if Baileys doesn't emit the messaging-history.set event
+      await this.syncMessagesFromDatabase(remoteJid, limit);
+
     } catch (error) {
+      // If no messages found for this chat, skip it silently (this is expected for empty chats)
+      if (error?.message?.[0] === 'Messages not found') {
+        this.logger.verbose(`Skipping sync for chat ${remoteJid}: no messages found in database`);
+        return;
+      }
+
       const errorMessage = error?.message || error?.toString() || JSON.stringify(error);
       this.logger.error(`Error syncing chat ${remoteJid}: ${errorMessage}`);
+    }
+  }
+
+  private async syncMessagesFromDatabase(remoteJid: string, limit: number): Promise<void> {
+    try {
+      this.logger.verbose(`Fetching up to ${limit} messages from database for ${remoteJid}`);
+
+      // Fetch messages from database
+      const messages = await this.prismaRepository.message.findMany({
+        where: {
+          instanceId: this.instanceId,
+          key: { path: ['remoteJid'], equals: remoteJid },
+        },
+        orderBy: { messageTimestamp: 'desc' },
+        take: limit,
+      });
+
+      if (messages.length === 0) {
+        this.logger.verbose(`No messages found in database for ${remoteJid}`);
+        return;
+      }
+
+      this.logger.info(`Found ${messages.length} messages in database for ${remoteJid}, sending to webhook`);
+
+      // Send to webhook as MESSAGES_SET event
+      // Sort by timestamp ascending (oldest first) to match the order of messaging-history.set
+      const messagesAscending = messages.reverse();
+      this.sendDataWebhook(Events.MESSAGES_SET, messagesAscending);
+
+      this.logger.verbose(`Successfully sent ${messages.length} messages to webhook for ${remoteJid}`);
+    } catch (error) {
+      this.logger.error(`Error syncing messages from database for ${remoteJid}: ${error.toString()}`);
     }
   }
 
