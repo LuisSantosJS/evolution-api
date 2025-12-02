@@ -60,6 +60,7 @@ import { PrismaRepository, Query } from '@api/repository/repository.service';
 import { chatbotController, waMonitor } from '@api/server.module';
 import { CacheService } from '@api/services/cache.service';
 import { ChannelStartupService } from '@api/services/channel.service';
+import { LidMappingService } from '@api/services/lid-mapping.service';
 import { Events, MessageSubtype, TypeMediaMessage, wa } from '@api/types/wa.types';
 import { CacheEngine } from '@cache/cacheengine';
 import {
@@ -237,6 +238,7 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
 
 export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
+  private lidMappingService: LidMappingService;
 
   constructor(
     public readonly configService: ConfigService,
@@ -254,6 +256,7 @@ export class BaileysStartupService extends ChannelStartupService {
     });
 
     this.authStateProvider = new AuthStateProvider(this.providerFiles);
+    this.lidMappingService = new LidMappingService(this.cache);
   }
 
   private authStateProvider: AuthStateProvider;
@@ -1300,6 +1303,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private readonly chatHandle = {
     'chats.upsert': async (chats: Chat[]) => {
+      // Resolve LIDs em todos os chats ANTES de processar
+      await Promise.all(chats.map((chat) => this.resolveLIDsInChat(chat)));
+
       const existingChatIds = await this.prismaRepository.chat.findMany({
         where: { instanceId: this.instanceId },
         select: { remoteJid: true },
@@ -1331,6 +1337,9 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       >[],
     ) => {
+      // Resolve LIDs em todos os chats ANTES de processar
+      await Promise.all(chats.map((chat) => this.resolveLIDsInChat(chat as Chat)));
+
       const chatsRaw = chats.map((chat) => {
         return { remoteJid: chat.id, instanceId: this.instanceId };
       });
@@ -1358,6 +1367,9 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly contactHandle = {
     'contacts.upsert': async (contacts: Contact[]) => {
       try {
+        // Resolve LIDs em todos os contatos ANTES de processar
+        await Promise.all(contacts.map((contact) => this.resolveLIDsInContact(contact)));
+
         const contactsRaw: any = contacts.map((contact) => ({
           remoteJid: contact.id,
           pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
@@ -1445,6 +1457,9 @@ export class BaileysStartupService extends ChannelStartupService {
     },
 
     'contacts.update': async (contacts: Partial<Contact>[]) => {
+      // Resolve LIDs em todos os contatos ANTES de processar
+      await Promise.all(contacts.map((contact) => this.resolveLIDsInContact(contact)));
+
       const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
       for await (const contact of contacts) {
         contactsRaw.push({
@@ -1674,6 +1689,9 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         for (const received of messages) {
+          // Resolve LIDs ANTES de qualquer processamento (usando cache Redis + timeout)
+          await this.resolveLIDsInMessage(received);
+
           // LID handling is now done automatically by Baileys 7.0
           // if (received.key.remoteJid?.includes('@lid')) {
           //   // Use remoteJidAlt if needed
@@ -4667,7 +4685,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  private getValidRemoteJid(obj: any): string | null {
+  private async getValidRemoteJid(obj: any): Promise<string | null> {
     if (!obj) return null;
 
     const remoteJid = obj.remoteJid;
@@ -4693,6 +4711,24 @@ export class BaileysStartupService extends ChannelStartupService {
     // Se id contém @s.whatsapp.net, usa ele
     if (id && id.includes('@s.whatsapp.net')) {
       return id;
+    }
+
+    // Se remoteJid é um LID, tenta buscar o PN correspondente usando cache Redis + Baileys
+    if (remoteJid && remoteJid.includes('@lid')) {
+      try {
+        const lidValue = remoteJid.replace('@lid', '');
+        // Usa o mesmo método de resolução com cache que o processamento em tempo real
+        const phoneNumber = await this.resolveLIDToPN(lidValue);
+
+        if (phoneNumber) {
+          this.logger.verbose(`[getValidRemoteJid] LID ${remoteJid} convertido para ${phoneNumber}@s.whatsapp.net`);
+          return `${phoneNumber}@s.whatsapp.net`;
+        } else {
+          this.logger.debug(`[getValidRemoteJid] Could not resolve LID ${remoteJid}, using as-is`);
+        }
+      } catch (error) {
+        this.logger.warn(`[getValidRemoteJid] Falha ao obter PN para LID ${remoteJid}: ${error?.message || error}`);
+      }
     }
 
     // Se nenhum contém @s.whatsapp.net, dá preferência ao remoteJid
@@ -4864,10 +4900,13 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       // Filter only individual chats (@s.whatsapp.net), ignore groups
-      const individualChats = recentChats.filter((chat) => {
-        const validRemoteJid = this.getValidRemoteJid(chat);
-        return validRemoteJid && validRemoteJid.includes('@s.whatsapp.net');
-      });
+      const individualChats = [];
+      for (const chat of recentChats) {
+        const validRemoteJid = await this.getValidRemoteJid(chat);
+        if (validRemoteJid && validRemoteJid.includes('@s.whatsapp.net')) {
+          individualChats.push({ ...chat, validRemoteJid });
+        }
+      }
 
       if (individualChats.length === 0) {
         this.logger.warn('No individual chats found');
@@ -4880,14 +4919,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
       // Process each chat
       for (const chat of individualChats) {
-        const validRemoteJid = this.getValidRemoteJid(chat);
-
-        if (!validRemoteJid) {
+        if (!chat.validRemoteJid) {
           this.logger.warn(`Invalid remoteJid for chat: ${chat.remoteJid}, skipping...`);
           continue;
         }
 
-        await this.syncSingleChat(validRemoteJid, limit);
+        await this.syncSingleChat(chat.validRemoteJid, limit);
 
         // Add a small delay between requests to avoid overwhelming the server
         await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -5385,6 +5422,141 @@ export class BaileysStartupService extends ChannelStartupService {
    * Prioriza: remoteJidAlt > senderPn > remoteJid (se não for LID) > LID (último caso)
    * Isso evita duplicação de conversas quando mensagens vêm pelo LID e são enviadas pelo número real
    */
+  /**
+   * Resolve LID para PN usando cache Redis + Baileys lidMapping com timeout
+   * @param lid - LID sem o @lid (ex: "40424601321473")
+   * @param timeoutMs - Timeout em milissegundos (padrão: 500ms)
+   * @returns Phone Number ou null se não conseguir resolver
+   */
+  private async resolveLIDToPN(lid: string, timeoutMs: number = 500): Promise<string | null> {
+    try {
+      // 1. Verifica cache Redis primeiro (rápido!)
+      const cachedPN = await this.lidMappingService.getPNForLID(lid);
+      if (cachedPN) {
+        return cachedPN;
+      }
+
+      // 2. Se não está no cache, tenta buscar do Baileys com timeout
+      const pnPromise = this.getPNFromBaileys(lid);
+      const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs));
+
+      const pn = await Promise.race([pnPromise, timeoutPromise]);
+
+      // 3. Se conseguiu resolver, salva no cache para próximas vezes
+      if (pn) {
+        await this.lidMappingService.storeLIDPNMapping(lid, pn);
+        return pn;
+      }
+
+      return null;
+    } catch (error) {
+      this.logger.warn(`[resolveLIDToPN] Error resolving LID ${lid}: ${error?.message || error}`);
+      return null;
+    }
+  }
+
+  /**
+   * Busca PN do Baileys signalRepository
+   */
+  private async getPNFromBaileys(lid: string): Promise<string | null> {
+    try {
+      // @ts-ignore - lidMapping disponível em Baileys v6.7.19+
+      if (this.client?.signalRepository?.lidMapping?.getPNForLID) {
+        // @ts-ignore
+        const pn = await this.client.signalRepository.lidMapping.getPNForLID(lid);
+        return pn || null;
+      }
+      return null;
+    } catch (error) {
+      this.logger.verbose(`[getPNFromBaileys] Failed: ${error?.message || error}`);
+      return null;
+    }
+  }
+
+  /**
+   * Resolve um JID que pode ser LID para PN
+   * Retorna o JID original se não conseguir resolver
+   */
+  private async resolveJID(jid: string | undefined | null): Promise<string | undefined | null> {
+    if (!jid) return jid;
+
+    if (jid.includes('@lid')) {
+      const lidValue = jid.replace('@lid', '');
+      const pn = await this.resolveLIDToPN(lidValue);
+
+      if (pn) {
+        const resolved = `${pn}@s.whatsapp.net`;
+        this.logger.verbose(`[resolveJID] ${jid} -> ${resolved}`);
+        return resolved;
+      }
+    }
+
+    return jid;
+  }
+
+  /**
+   * Resolve LIDs em uma mensagem ANTES do processamento
+   * Modifica a mensagem in-place para substituir LID por PN quando possível
+   */
+  private async resolveLIDsInMessage(message: proto.IWebMessageInfo): Promise<void> {
+    try {
+      const key = message.key;
+      if (!key) return;
+
+      // Resolve remoteJid se for LID
+      if (key.remoteJid) {
+        const resolved = await this.resolveJID(key.remoteJid);
+        if (resolved && resolved !== key.remoteJid) {
+          key.remoteJid = resolved;
+        }
+      }
+
+      // Resolve participant se for LID
+      if (key.participant) {
+        const resolved = await this.resolveJID(key.participant);
+        if (resolved && resolved !== key.participant) {
+          key.participant = resolved;
+        }
+      }
+    } catch (error) {
+      this.logger.warn(`[resolveLIDsInMessage] Error: ${error?.message || error}`);
+    }
+  }
+
+  /**
+   * Resolve LIDs em um contato
+   */
+  private async resolveLIDsInContact(contact: Partial<Contact>): Promise<void> {
+    try {
+      if (contact.id) {
+        const resolved = await this.resolveJID(contact.id);
+        if (resolved && resolved !== contact.id) {
+          this.logger.verbose(`[resolveLIDsInContact] ${contact.id} -> ${resolved}`);
+          contact.id = resolved;
+        }
+      }
+    } catch (error) {
+      this.logger.warn(`[resolveLIDsInContact] Error: ${error?.message || error}`);
+    }
+  }
+
+  /**
+   * Resolve LIDs em um chat
+   */
+  private async resolveLIDsInChat(chat: Chat): Promise<void> {
+    try {
+      if (chat.id) {
+        const resolved = await this.resolveJID(chat.id);
+        if (resolved && resolved !== chat.id) {
+          this.logger.verbose(`[resolveLIDsInChat] ${chat.id} -> ${resolved}`);
+          chat.id = resolved;
+        }
+      }
+    } catch (error) {
+      this.logger.warn(`[resolveLIDsInChat] Error: ${error?.message || error}`);
+    }
+  }
+
   private normalizeRemoteJid(key: any): string | null {
     // Validação inicial: verifica se key existe
     if (!key) {
