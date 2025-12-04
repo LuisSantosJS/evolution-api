@@ -264,7 +264,9 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly msgRetryCounterCache: CacheStore = new NodeCache({ stdTTL: 60, useClones: false });
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private readonly messageStubRetryCache: Map<string, WAMessage> = new Map();
+  private readonly messageStubRetryMetadata: Map<string, { retryCount: number; timestamp: number; jid: string; lastError?: string }> = new Map();
   private readonly sessionErrorCache: Map<string, { count: number; lastError: number }> = new Map();
+  private readonly sessionErrorStats: Map<string, { badMacCount: number; noSessionCount: number; lastErrorType: string; lastErrorTime: number }> = new Map();
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private lastActivity: number = Date.now();
@@ -278,6 +280,17 @@ export class BaileysStartupService extends ChannelStartupService {
   private streamHealthCheckInterval: NodeJS.Timeout | null = null;
   private readonly STREAM_HEALTH_CHECK_INTERVAL = 30000; // 30 seconds - check if stream is alive
 
+  // Cache cleanup interval
+  private cacheCleanupInterval: NodeJS.Timeout | null = null;
+  private readonly CACHE_CLEANUP_INTERVAL = 300000; // 5 minutes - cleanup expired entries
+
+  // Track last event received to detect dead connections
+  private lastEventReceivedAt: number = Date.now();
+  private readonly MAX_EVENT_SILENCE_MS = 300000; // 5 minutes - warning threshold
+  private readonly CRITICAL_EVENT_SILENCE_MS = 600000; // 10 minutes - critical threshold for auto-reconnect
+  private zombieCheckFailures: number = 0; // Count consecutive failures
+  private readonly MAX_ZOMBIE_FAILURES = 3; // Require 3 consecutive checks before reconnecting
+
   // Event listener callbacks stored for cleanup
   private wsCallListener: ((packet: any) => void) | null = null;
   private wsCallAckListener: ((packet: any) => void) | null = null;
@@ -287,9 +300,22 @@ export class BaileysStartupService extends ChannelStartupService {
 
   // Reconnection lock to prevent simultaneous reconnections
   private reconnectLock = false;
+  private reconnectLockPromise: Promise<void> | null = null;
   private reconnectAttempts = 0;
   private readonly MAX_RECONNECT_DELAY = 30000; // Max 30 seconds
   private readonly BASE_RECONNECT_DELAY = 2000; // Start with 2 seconds
+  private readonly MAX_RECONNECT_ATTEMPTS = 15; // Maximum reconnection attempts before circuit breaker
+  private lastSuccessfulConnection: number | null = null; // Track last successful connection
+  private readonly RECONNECT_ATTEMPTS_RESET_MS = 3600000; // Reset attempts after 1 hour of successful connection
+
+  // Circuit breaker pattern
+  private circuitBreakerState: 'closed' | 'open' | 'half-open' = 'closed';
+  private circuitBreakerOpenedAt: number | null = null;
+  private readonly CIRCUIT_BREAKER_TIMEOUT_MS = 300000; // 5 minutes before retry after circuit opens
+  private readonly CIRCUIT_BREAKER_FAILURE_THRESHOLD = 10; // Failures within window to open circuit
+  private readonly CIRCUIT_BREAKER_WINDOW_MS = 600000; // 10 minutes failure tracking window
+  private recentFailures: number[] = []; // Timestamps of recent failures
+
   private isClientReady = false;
   private clientReadyTimeout: NodeJS.Timeout | null = null; // NOVO: Para limpar timeout
 
@@ -298,10 +324,37 @@ export class BaileysStartupService extends ChannelStartupService {
   private lastDatabaseStatusUpdate: { state: string; timestamp: number } | null = null;
   private readonly STATUS_SYNC_DEBOUNCE_MS = 1000; // Debounce database updates
 
+  // Event sequencing to prevent out-of-order webhooks
+  private eventSequenceNumber = 0;
+  private lastWebhookState: 'open' | 'close' | 'connecting' | 'reconnecting' | null = null;
+  private pendingWebhookTimeout: NodeJS.Timeout | null = null;
+
+  // Temporary disconnection tracking for debouncing close events
+  private temporaryDisconnectionStartedAt: number | null = null;
+  private closeEventDebounceTimeout: NodeJS.Timeout | null = null;
+  private readonly CLOSE_EVENT_DEBOUNCE_MS = 5000; // Only send 'close' if still disconnected after 5s
+
   // Constants for cache limits
   private readonly MAX_MESSAGE_STUB_RETRY_CACHE = 1000;
   private readonly MAX_SESSION_ERROR_CACHE = 500;
   private readonly SESSION_ERROR_TTL_MS = 3600000; // 1 hour
+  private readonly MAX_STUB_RETRY_ATTEMPTS = 3;
+  private readonly STUB_RETRY_DELAY_MS = 2000; // 2 seconds base delay
+
+  // Connection metrics
+  private connectionMetrics = {
+    totalConnections: 0,
+    totalDisconnections: 0,
+    totalReconnectionAttempts: 0,
+    totalSuccessfulReconnections: 0,
+    totalFailedReconnections: 0,
+    lastConnectionAt: null as Date | null,
+    lastDisconnectionAt: null as Date | null,
+    connectionUptime: 0,
+    averageConnectionDuration: 0,
+    circuitBreakerOpenCount: 0,
+    qrCodeGeneratedCount: 0,
+  };
 
   public stateConnection: wa.StateConnection = { state: 'close' };
 
@@ -309,6 +362,27 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public get connectionStatus() {
     return this.stateConnection;
+  }
+
+  /**
+   * Get connection metrics for monitoring and debugging
+   */
+  public getConnectionMetrics() {
+    // Calculate current uptime if connected
+    if (this.stateConnection.state === 'open' && this.connectionMetrics.lastConnectionAt) {
+      const currentUptime = Date.now() - this.connectionMetrics.lastConnectionAt.getTime();
+      return {
+        ...this.connectionMetrics,
+        currentUptime,
+        isConnected: true,
+      };
+    }
+
+    return {
+      ...this.connectionMetrics,
+      currentUptime: 0,
+      isConnected: false,
+    };
   }
 
   /**
@@ -364,10 +438,67 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   /**
+   * Send CONNECTION_UPDATE webhook with sequencing to prevent out-of-order delivery
+   * Prevents race conditions when connection changes rapidly (close → open)
+   */
+  private sendConnectionUpdateWebhook(
+    state: 'open' | 'close' | 'connecting' | 'reconnecting',
+    data: any,
+    force = false,
+  ) {
+    // Increment sequence number for this event
+    const sequenceNumber = ++this.eventSequenceNumber;
+
+    // Cancel any pending webhook if new state arrives
+    if (this.pendingWebhookTimeout) {
+      clearTimeout(this.pendingWebhookTimeout);
+      this.pendingWebhookTimeout = null;
+    }
+
+    // Skip duplicate states unless forced (prevents spam during reconnection)
+    if (!force && this.lastWebhookState === state && (state === 'close' || state === 'reconnecting')) {
+      this.logger.verbose(`Skipping duplicate CONNECTION_UPDATE webhook for state '${state}'`);
+      return;
+    }
+
+    // Critical state changes should be sent immediately:
+    // - open → close (real disconnection)
+    // - close → open (successful reconnection)
+    // - open → reconnecting (temporary disconnection started)
+    // - reconnecting → open (recovered from temporary issue)
+    // - state === 'open' (always send open immediately)
+    const isCriticalChange =
+      (this.lastWebhookState === 'open' && state === 'close') ||
+      (this.lastWebhookState === 'open' && state === 'reconnecting') ||
+      (this.lastWebhookState === 'close' && state === 'open') ||
+      (this.lastWebhookState === 'reconnecting' && state === 'open') ||
+      state === 'open'; // Always send 'open' immediately
+
+    const sendWebhook = () => {
+      this.lastWebhookState = state;
+      this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+        ...data,
+        state,
+        sequenceNumber, // Add sequence number for client-side ordering
+      });
+      this.logger.verbose(`CONNECTION_UPDATE webhook sent: state='${state}', seq=${sequenceNumber}`);
+    };
+
+    if (isCriticalChange || force) {
+      // Send immediately for critical changes
+      sendWebhook();
+    } else {
+      // Debounce non-critical changes (e.g., multiple 'connecting' events)
+      this.pendingWebhookTimeout = setTimeout(sendWebhook, 500);
+    }
+  }
+
+  /**
    * Atualiza o status da conexão de forma atômica e sincronizada
    * - Atualiza memória imediatamente (in-memory state)
    * - Atualiza banco de dados de forma assíncrona com debounce
    * - Garante consistência entre todas as fontes de status
+   * - Envia webhooks com sequenciamento para prevenir entrega fora de ordem
    *
    * @param newState - Novo estado da conexão
    * @param additionalData - Dados adicionais para atualizar no banco (opcional)
@@ -539,8 +670,9 @@ export class BaileysStartupService extends ChannelStartupService {
     // Clear any existing interval
     this.stopStreamHealthCheck();
 
-    this.streamHealthCheckInterval = setInterval(() => {
+    this.streamHealthCheckInterval = setInterval(async () => {
       try {
+        // Check 1: Message processor stream health
         if (!this.messageProcessor.isStreamHealthy()) {
           const stats = this.messageProcessor.getStreamStats();
           this.logger.error('Message processor stream is DEAD! Recreating...');
@@ -554,6 +686,133 @@ export class BaileysStartupService extends ChannelStartupService {
           });
 
           this.logger.warn('Message processor stream RECREATED successfully');
+        }
+
+        // Check 2: Detect "zombie" connections - connected but no events
+        const timeSinceLastEvent = Date.now() - this.lastEventReceivedAt;
+
+        // Check if connection appears open but is actually degraded
+        const isDegraded = this.stateConnection.state === 'open' && timeSinceLastEvent > this.MAX_EVENT_SILENCE_MS;
+        const wasDegraded = this.stateConnection.state === 'connecting' && timeSinceLastEvent > this.MAX_EVENT_SILENCE_MS;
+
+        if (isDegraded || wasDegraded) {
+          // Stage 1: Warning (5 minutes)
+          if (timeSinceLastEvent < this.CRITICAL_EVENT_SILENCE_MS) {
+            this.logger.warn(
+              `WARNING: No events received for ${Math.round(timeSinceLastEvent / 1000)}s. Connection may be degraded.`,
+            );
+            this.zombieCheckFailures++;
+
+            // Only update status on FIRST detection (when state is still 'open')
+            if (this.stateConnection.state === 'open') {
+              // Update status to 'connecting' to indicate degraded connection
+              await this.updateConnectionStatus('connecting', {
+                disconnectionReasonCode: 503, // Service Unavailable
+                disconnectionObject: JSON.stringify({
+                  reason: 'Connection degraded - no events received',
+                  silenceDuration: timeSinceLastEvent,
+                  stage: 'warning',
+                }),
+              });
+
+              // Notify via webhook that connection is degraded
+              this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+                instance: this.instance.name,
+                state: 'connecting',
+                statusReason: 503,
+              });
+            }
+          }
+          // Stage 2: Critical (10+ minutes) - requires multiple consecutive failures
+          else {
+            this.zombieCheckFailures++;
+            this.logger.error(
+              `ZOMBIE CONNECTION DETECTED: No events for ${Math.round(timeSinceLastEvent / 1000)}s (failure #${this.zombieCheckFailures}/${this.MAX_ZOMBIE_FAILURES})`,
+            );
+
+            // Only reconnect after multiple consecutive failures (SAFETY MECHANISM)
+            if (this.zombieCheckFailures >= this.MAX_ZOMBIE_FAILURES) {
+              this.logger.error(
+                `CRITICAL: Connection is definitively DEAD after ${this.zombieCheckFailures} consecutive checks. Validating...`,
+              );
+
+              // CRITICAL FIX: Validate connection is actually dead before disconnecting
+              const wsState = (this.client?.ws as any)?.readyState;
+              const hasUserId = !!this.client?.user?.id;
+              const isClientReady = this.isClientReady;
+
+              this.logger.warn(
+                `Connection health check: wsState=${wsState} (1=OPEN), hasUserId=${hasUserId}, isClientReady=${isClientReady}`,
+              );
+
+              // If WebSocket is OPEN and user is authenticated, connection might be healthy
+              if (wsState === 1 && hasUserId && isClientReady) {
+                this.logger.warn(
+                  'ZOMBIE FALSE POSITIVE: Connection appears healthy despite no events. Resetting zombie counter and keeping connection.',
+                );
+                this.zombieCheckFailures = 0;
+                this.lastEventReceivedAt = Date.now(); // Reset event timer
+                return; // Don't disconnect healthy connection
+              }
+
+              try {
+                // Reset counter before reconnecting
+                this.zombieCheckFailures = 0;
+
+                this.logger.error(
+                  `Connection confirmed DEAD (wsState=${wsState}, hasUserId=${hasUserId}). Forcing reconnection...`,
+                );
+
+                // Force connection state to close and emit event
+                await this.updateConnectionStatus('close', {
+                  disconnectionAt: new Date(),
+                  disconnectionReasonCode: 408, // Request Timeout
+                  disconnectionObject: JSON.stringify({
+                    reason: 'Zombie connection detected - no events received',
+                    silenceDuration: timeSinceLastEvent,
+                  }),
+                });
+
+                // Send CONNECTION_UPDATE event to notify systems
+                this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+                  instance: this.instance.name,
+                  state: 'close',
+                  statusReason: 408,
+                });
+
+                this.logger.warn('Initiating automatic reconnection for zombie connection...');
+
+                // Trigger reconnection (will be handled by connectionUpdate event)
+                await this.connectToWhatsapp(this.phoneNumber);
+              } catch (error) {
+                this.logger.error('Failed to reconnect zombie connection:');
+                this.logger.error(error);
+              }
+            }
+          }
+        } else {
+          // Reset failure counter if events are being received normally
+          if (this.zombieCheckFailures > 0) {
+            this.logger.info(`Connection recovered - resetting zombie check counter (was ${this.zombieCheckFailures})`);
+            this.zombieCheckFailures = 0;
+
+            // If connection was marked as degraded (connecting), restore to open
+            if (this.stateConnection.state === 'connecting') {
+              await this.updateConnectionStatus('open', {
+                disconnectionReasonCode: 200, // OK
+                disconnectionObject: JSON.stringify({
+                  reason: 'Connection recovered - events being received normally',
+                }),
+              });
+
+              // Notify via webhook that connection recovered
+              this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+                instance: this.instance.name,
+                state: 'open',
+                statusReason: 200,
+              });
+            }
+          }
         }
       } catch (error) {
         this.logger.error('Error during stream health check:');
@@ -571,6 +830,126 @@ export class BaileysStartupService extends ChannelStartupService {
     if (this.streamHealthCheckInterval) {
       clearInterval(this.streamHealthCheckInterval);
       this.streamHealthCheckInterval = null;
+    }
+  }
+
+  /**
+   * Starts periodic cache cleanup to remove expired entries
+   * Prevents memory leaks from unbounded cache growth
+   */
+  private startCacheCleanup() {
+    // Clear any existing interval
+    this.stopCacheCleanup();
+
+    this.cacheCleanupInterval = setInterval(() => {
+      try {
+        this.cleanExpiredCacheEntries();
+      } catch (error) {
+        this.logger.error('Error during cache cleanup:');
+        this.logger.error(error);
+      }
+    }, this.CACHE_CLEANUP_INTERVAL);
+
+    this.logger.verbose(`Cache cleanup started (interval: ${this.CACHE_CLEANUP_INTERVAL}ms)`);
+  }
+
+  /**
+   * Stops periodic cache cleanup
+   */
+  private stopCacheCleanup() {
+    if (this.cacheCleanupInterval) {
+      clearInterval(this.cacheCleanupInterval);
+      this.cacheCleanupInterval = null;
+    }
+  }
+
+  /**
+   * Clean expired entries from caches based on TTL
+   */
+  private cleanExpiredCacheEntries() {
+    const now = Date.now();
+    let cleanedSessionErrors = 0;
+    let cleanedSessionStats = 0;
+    let cleanedStubRetryMetadata = 0;
+
+    // Clean expired session errors
+    for (const [jid, entry] of this.sessionErrorCache.entries()) {
+      if (now - entry.lastError >= this.SESSION_ERROR_TTL_MS) {
+        this.sessionErrorCache.delete(jid);
+        cleanedSessionErrors++;
+      }
+    }
+
+    // Clean expired session error stats
+    for (const [jid, entry] of this.sessionErrorStats.entries()) {
+      if (now - entry.lastErrorTime >= this.SESSION_ERROR_TTL_MS) {
+        this.sessionErrorStats.delete(jid);
+        cleanedSessionStats++;
+      }
+    }
+
+    // Clean expired stub retry metadata (older than 10 minutes)
+    for (const [messageId, entry] of this.messageStubRetryMetadata.entries()) {
+      if (now - entry.timestamp >= 600000) {
+        this.messageStubRetryMetadata.delete(messageId);
+        // Also clean the corresponding message from retry cache
+        this.messageStubRetryCache.delete(messageId);
+        cleanedStubRetryMetadata++;
+      }
+    }
+
+    if (cleanedSessionErrors > 0 || cleanedSessionStats > 0 || cleanedStubRetryMetadata > 0) {
+      this.logger.verbose(
+        `Cache cleanup: removed ${cleanedSessionErrors} session errors, ` +
+        `${cleanedSessionStats} session stats, ${cleanedStubRetryMetadata} stub retries ` +
+        `(current sizes: sessionErrors=${this.sessionErrorCache.size}, ` +
+        `sessionStats=${this.sessionErrorStats.size}, stubRetries=${this.messageStubRetryCache.size})`
+      );
+    }
+
+    // Log session error statistics every cleanup cycle
+    this.logSessionErrorStatistics();
+  }
+
+  /**
+   * Log session error statistics to help identify problematic contacts
+   */
+  private logSessionErrorStatistics() {
+    if (this.sessionErrorStats.size === 0 && this.messageStubRetryCache.size === 0) {
+      return; // No errors to report
+    }
+
+    // Sort JIDs by total error count (descending)
+    const statsArray = Array.from(this.sessionErrorStats.entries())
+      .map(([jid, stats]) => ({
+        jid,
+        totalErrors: stats.badMacCount + stats.noSessionCount,
+        badMacCount: stats.badMacCount,
+        noSessionCount: stats.noSessionCount,
+        lastErrorType: stats.lastErrorType,
+        lastErrorTime: stats.lastErrorTime
+      }))
+      .sort((a, b) => b.totalErrors - a.totalErrors);
+
+    if (statsArray.length > 0) {
+      const top10 = statsArray.slice(0, 10);
+      const totalBadMac = statsArray.reduce((sum, s) => sum + s.badMacCount, 0);
+      const totalNoSession = statsArray.reduce((sum, s) => sum + s.noSessionCount, 0);
+
+      this.logger.warn(
+        `\n========== Session Error Statistics ==========\n` +
+        `Total JIDs with errors: ${statsArray.length}\n` +
+        `Total Bad MAC errors: ${totalBadMac}\n` +
+        `Total No Session errors: ${totalNoSession}\n` +
+        `Pending stubType 2 retries: ${this.messageStubRetryCache.size}\n` +
+        `\nTop 10 JIDs with most errors:\n` +
+        top10.map((s, i) =>
+          `${i + 1}. ${s.jid}\n` +
+          `   Total: ${s.totalErrors} | BadMAC: ${s.badMacCount} | NoSession: ${s.noSessionCount} | ` +
+          `Last: ${s.lastErrorType}`
+        ).join('\n') +
+        `\n============================================`
+      );
     }
   }
 
@@ -603,15 +982,67 @@ export class BaileysStartupService extends ChannelStartupService {
 
       // Clear cache maps with size limits
       this.messageStubRetryCache.clear();
+      this.messageStubRetryMetadata.clear();
       this.sessionErrorCache.clear();
+      this.sessionErrorStats.clear();
 
       // Stop background intervals
       this.stopSettingsCacheRefresh();
       this.stopStreamHealthCheck();
+      this.stopCacheCleanup();
       this.settingsCache = null;
+
+      // Clear pending webhook timeout
+      if (this.pendingWebhookTimeout) {
+        clearTimeout(this.pendingWebhookTimeout);
+        this.pendingWebhookTimeout = null;
+      }
     } catch (error) {
       this.logger.warn('Error during event listener cleanup:');
       this.logger.warn(error);
+    }
+  }
+
+  /**
+   * Atomic lock acquisition helper
+   * Prevents race conditions by ensuring only one operation at a time
+   */
+  private async acquireLock(lockName: 'reconnect' | 'statusUpdate', timeout = 10000): Promise<boolean> {
+    const startTime = Date.now();
+
+    if (lockName === 'reconnect') {
+      while (this.reconnectLock) {
+        if (Date.now() - startTime > timeout) {
+          this.logger.warn(`Failed to acquire ${lockName} lock after ${timeout}ms`);
+          return false;
+        }
+        await delay(100);
+      }
+      this.reconnectLock = true;
+      return true;
+    } else if (lockName === 'statusUpdate') {
+      while (this.statusUpdateLock) {
+        if (Date.now() - startTime > timeout) {
+          this.logger.warn(`Failed to acquire ${lockName} lock after ${timeout}ms`);
+          return false;
+        }
+        await delay(100);
+      }
+      this.statusUpdateLock = true;
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Release lock
+   */
+  private releaseLock(lockName: 'reconnect' | 'statusUpdate'): void {
+    if (lockName === 'reconnect') {
+      this.reconnectLock = false;
+    } else if (lockName === 'statusUpdate') {
+      this.statusUpdateLock = false;
     }
   }
 
@@ -698,14 +1129,15 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
-        this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+        // Use sequenced webhook to prevent out-of-order delivery
+        this.sendConnectionUpdateWebhook('close', {
           instance: this.instance.name,
-          state: 'refused',
           statusReason: DisconnectReason.connectionClosed,
           wuid: this.instance.wuid,
           profileName: await this.getProfileName(),
           profilePictureUrl: this.instance.profilePictureUrl,
-        });
+          message: 'QR code limit reached',
+        }, true); // Force send even if duplicate
 
         this.endSession = true;
 
@@ -713,6 +1145,7 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       this.instance.qrcode.count++;
+      this.connectionMetrics.qrCodeGeneratedCount++;
 
       const color = this.configService.get<QrCode>('QRCODE').COLOR;
 
@@ -772,6 +1205,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // Processar mudança de estado baseado no valor de 'connection'
     if (connection === 'close') {
+      // Track disconnection metrics
+      this.connectionMetrics.totalDisconnections++;
+      this.connectionMetrics.lastDisconnectionAt = new Date();
+
+      // Calculate uptime if we were connected
+      if (this.connectionMetrics.lastConnectionAt) {
+        this.connectionMetrics.connectionUptime =
+          this.connectionMetrics.lastDisconnectionAt.getTime() -
+          this.connectionMetrics.lastConnectionAt.getTime();
+      }
+
       // Mark client as not ready when connection closes
       this.isClientReady = false;
 
@@ -780,6 +1224,11 @@ export class BaileysStartupService extends ChannelStartupService {
         clearTimeout(this.clientReadyTimeout);
         this.clientReadyTimeout = null;
       }
+
+      // Detect if this is a temporary disconnection (was connected recently)
+      const now = Date.now();
+      const wasRecentlyConnected = this.connectionMetrics.lastConnectionAt &&
+        (now - this.connectionMetrics.lastConnectionAt.getTime()) < 30000; // Within last 30 seconds
 
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
 
@@ -791,9 +1240,162 @@ export class BaileysStartupService extends ChannelStartupService {
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
 
-      if (shouldReconnect && !this.reconnectLock) {
-        this.reconnectLock = true;
+      // Handle temporary disconnections differently from permanent ones
+      // If we were recently connected and should reconnect, this is likely a temporary network issue
+      if (wasRecentlyConnected && shouldReconnect) {
+        // Record disconnection start time if not already tracking
+        if (!this.temporaryDisconnectionStartedAt) {
+          this.temporaryDisconnectionStartedAt = now;
+          this.logger.verbose(`Temporary disconnection detected (was connected ${Math.round((now - this.connectionMetrics.lastConnectionAt!.getTime()) / 1000)}s ago)`);
+        }
+
+        const disconnectionDuration = now - this.temporaryDisconnectionStartedAt;
+
+        // Send 'reconnecting' webhook immediately to inform clients this is temporary
+        this.sendConnectionUpdateWebhook('reconnecting', {
+          instance: this.instance.name,
+          statusReason: statusCode,
+          wuid: this.instance.wuid,
+          profileName: await this.getProfileName(),
+          profilePictureUrl: this.instance.profilePictureUrl,
+          isTemporary: true,
+          disconnectionDuration,
+          disconnectionReason: (lastDisconnect?.error as Boom)?.message || 'Connection lost',
+        }, true); // Force send
+
+        // Set up debounce timer: only send 'close' if still disconnected after 5 seconds
+        if (this.closeEventDebounceTimeout) {
+          clearTimeout(this.closeEventDebounceTimeout);
+        }
+
+        this.closeEventDebounceTimeout = setTimeout(() => {
+          // Check if still disconnected after debounce period
+          if (this.stateConnection.state !== 'open') {
+            const finalDuration = Date.now() - this.temporaryDisconnectionStartedAt!;
+            this.logger.warn(`Disconnection persisted for ${Math.round(finalDuration / 1000)}s - sending 'close' event`);
+
+            this.sendConnectionUpdateWebhook('close', {
+              instance: this.instance.name,
+              statusReason: statusCode,
+              wuid: this.instance.wuid,
+              profileName: this.getProfileName(),
+              profilePictureUrl: this.instance.profilePictureUrl,
+              isTemporary: false,
+              disconnectionDuration: finalDuration,
+              disconnectionReason: (lastDisconnect?.error as Boom)?.message || 'Connection closed',
+            }, true);
+          } else {
+            this.logger.verbose('Connection recovered before close debounce - close event cancelled');
+          }
+          // Reset temporary disconnection tracking
+          this.temporaryDisconnectionStartedAt = null;
+          this.closeEventDebounceTimeout = null;
+        }, this.CLOSE_EVENT_DEBOUNCE_MS);
+      } else if (!shouldReconnect) {
+        // Permanent disconnection (logout, ban, etc.) - send 'close' immediately
+        this.logger.info(`Permanent disconnection detected (statusCode: ${statusCode})`);
+        this.sendConnectionUpdateWebhook('close', {
+          instance: this.instance.name,
+          statusReason: statusCode,
+          wuid: this.instance.wuid,
+          profileName: await this.getProfileName(),
+          profilePictureUrl: this.instance.profilePictureUrl,
+          isTemporary: false,
+          disconnectionDuration: 0,
+          disconnectionReason: (lastDisconnect?.error as Boom)?.message || 'Permanent disconnection',
+        }, true);
+        // Reset temporary disconnection tracking
+        this.temporaryDisconnectionStartedAt = null;
+        if (this.closeEventDebounceTimeout) {
+          clearTimeout(this.closeEventDebounceTimeout);
+          this.closeEventDebounceTimeout = null;
+        }
+      }
+
+      // Track failure for circuit breaker
+      if (shouldReconnect) {
+        const now = Date.now();
+        this.recentFailures.push(now);
+        // Clean old failures outside the window
+        this.recentFailures = this.recentFailures.filter((timestamp) => now - timestamp < this.CIRCUIT_BREAKER_WINDOW_MS);
+
+        // Check if circuit breaker should open
+        if (
+          this.circuitBreakerState === 'closed' &&
+          this.recentFailures.length >= this.CIRCUIT_BREAKER_FAILURE_THRESHOLD
+        ) {
+          this.circuitBreakerState = 'open';
+          this.circuitBreakerOpenedAt = now;
+          this.connectionMetrics.circuitBreakerOpenCount++;
+          this.logger.error(
+            `Circuit breaker OPENED after ${this.recentFailures.length} failures in ${this.CIRCUIT_BREAKER_WINDOW_MS / 1000}s`,
+          );
+        }
+      }
+
+      // Check circuit breaker state
+      if (this.circuitBreakerState === 'open') {
+        const timeSinceOpened = Date.now() - (this.circuitBreakerOpenedAt || 0);
+        if (timeSinceOpened >= this.CIRCUIT_BREAKER_TIMEOUT_MS) {
+          // Try half-open state
+          this.circuitBreakerState = 'half-open';
+          this.logger.warn(
+            `Circuit breaker entering HALF-OPEN state after ${this.CIRCUIT_BREAKER_TIMEOUT_MS / 1000}s timeout`,
+          );
+        } else {
+          this.logger.warn(
+            `Circuit breaker is OPEN - blocking reconnection attempt (retry in ${Math.ceil((this.CIRCUIT_BREAKER_TIMEOUT_MS - timeSinceOpened) / 1000)}s)`,
+          );
+          // Update status but don't reconnect
+          await this.updateConnectionStatus('close', {
+            disconnectionAt: new Date(),
+            disconnectionReasonCode: statusCode,
+            disconnectionObject: JSON.stringify(lastDisconnect),
+          });
+          return;
+        }
+      }
+
+      // Reset reconnect attempts if last successful connection was over 1 hour ago
+      if (this.lastSuccessfulConnection && Date.now() - this.lastSuccessfulConnection >= this.RECONNECT_ATTEMPTS_RESET_MS) {
+        this.logger.info(
+          `Resetting reconnect attempts counter (last successful connection was over ${this.RECONNECT_ATTEMPTS_RESET_MS / 1000}s ago)`,
+        );
+        this.reconnectAttempts = 0;
+      }
+
+      if (shouldReconnect) {
+        // Check max reconnection attempts
+        if (this.reconnectAttempts >= this.MAX_RECONNECT_ATTEMPTS) {
+          this.logger.error(
+            `Maximum reconnection attempts reached (${this.MAX_RECONNECT_ATTEMPTS}). Stopping automatic reconnection.`,
+          );
+          // Use sequenced webhook to prevent out-of-order delivery
+          this.sendConnectionUpdateWebhook('close', {
+            instance: this.instance.name,
+            statusReason: statusCode,
+            wuid: this.instance.wuid,
+            profileName: await this.getProfileName(),
+            profilePictureUrl: this.instance.profilePictureUrl,
+            message: `Maximum reconnection attempts (${this.MAX_RECONNECT_ATTEMPTS}) reached`,
+          }, true); // Force send
+          await this.updateConnectionStatus('close', {
+            disconnectionAt: new Date(),
+            disconnectionReasonCode: statusCode,
+            disconnectionObject: JSON.stringify(lastDisconnect),
+          });
+          return;
+        }
+
+        // Acquire lock atomically with timeout
+        const lockAcquired = await this.acquireLock('reconnect', 5000);
+        if (!lockAcquired) {
+          this.logger.warn('Failed to acquire reconnection lock - another reconnection may be in progress');
+          return;
+        }
+
         this.reconnectAttempts++;
+        this.connectionMetrics.totalReconnectionAttempts++;
 
         // Calculate exponential backoff delay: 2s, 4s, 8s, 16s, 30s (max)
         const exponentialDelay = Math.min(
@@ -802,7 +1404,7 @@ export class BaileysStartupService extends ChannelStartupService {
         );
 
         this.logger.info(
-          `Initiating reconnection with lock... (attempt #${this.reconnectAttempts}, delay: ${exponentialDelay}ms)`,
+          `Initiating reconnection with lock... (attempt #${this.reconnectAttempts}/${this.MAX_RECONNECT_ATTEMPTS}, delay: ${exponentialDelay}ms, circuit: ${this.circuitBreakerState})`,
         );
 
         // Atualizar status para 'close' atomicamente
@@ -818,21 +1420,22 @@ export class BaileysStartupService extends ChannelStartupService {
           await delay(exponentialDelay);
           await this.connectToWhatsapp(this.phoneNumber);
 
-          // Reset reconnect attempts on successful connection (will be set to 0 when connection opens)
+          // If half-open, successful connection will close the circuit in connection === 'open' handler
+          this.connectionMetrics.totalSuccessfulReconnections++;
         } catch (error) {
-          this.logger.error(`Reconnection failed (attempt #${this.reconnectAttempts}): ${error.message}`);
+          this.logger.error(`Reconnection failed (attempt #${this.reconnectAttempts}/${this.MAX_RECONNECT_ATTEMPTS}): ${error.message}`);
+          this.connectionMetrics.totalFailedReconnections++;
           // Don't reset attempts - let exponential backoff continue
+          // If half-open, reopen the circuit on failure
+          if (this.circuitBreakerState === 'half-open') {
+            this.circuitBreakerState = 'open';
+            this.circuitBreakerOpenedAt = Date.now();
+            this.connectionMetrics.circuitBreakerOpenCount++;
+            this.logger.error('Circuit breaker reopened after failed half-open attempt');
+          }
         } finally {
-          this.reconnectLock = false;
+          this.releaseLock('reconnect');
         }
-      } else if (this.reconnectLock) {
-        this.logger.warn('Reconnection already in progress, skipping duplicate reconnection attempt');
-        // Atualizar status mesmo se reconexão já está em progresso
-        await this.updateConnectionStatus('close', {
-          disconnectionAt: new Date(),
-          disconnectionReasonCode: statusCode,
-          disconnectionObject: JSON.stringify(lastDisconnect),
-        });
       } else {
         // Código padrão para erros que não devem reconnectar
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
@@ -900,9 +1503,53 @@ export class BaileysStartupService extends ChannelStartupService {
         profilePicUrl: this.instance.profilePictureUrl,
       });
 
+      // Track connection metrics
+      this.connectionMetrics.totalConnections++;
+      const connectionTime = new Date();
+      this.connectionMetrics.lastConnectionAt = connectionTime;
+
+      // Calculate average connection duration if we have a last disconnection
+      if (this.connectionMetrics.lastDisconnectionAt) {
+        const lastDuration = this.connectionMetrics.lastDisconnectionAt.getTime() -
+          (this.connectionMetrics.lastConnectionAt ? this.connectionMetrics.lastConnectionAt.getTime() : 0);
+
+        if (lastDuration > 0) {
+          // Running average
+          this.connectionMetrics.averageConnectionDuration =
+            (this.connectionMetrics.averageConnectionDuration * (this.connectionMetrics.totalConnections - 1) + lastDuration) /
+            this.connectionMetrics.totalConnections;
+        }
+      }
+
       // Reset reconnect attempts counter on successful connection
       this.reconnectAttempts = 0;
+      this.lastSuccessfulConnection = Date.now();
       this.logger.verbose('Reconnection attempts counter reset');
+
+      // Cancel any pending close event debounce timer
+      if (this.closeEventDebounceTimeout) {
+        clearTimeout(this.closeEventDebounceTimeout);
+        this.closeEventDebounceTimeout = null;
+        this.logger.verbose('Cancelled pending close event (connection recovered)');
+      }
+
+      // Reset temporary disconnection tracking
+      if (this.temporaryDisconnectionStartedAt) {
+        const recoveryTime = Date.now() - this.temporaryDisconnectionStartedAt;
+        this.logger.info(`Connection recovered from temporary disconnection after ${Math.round(recoveryTime / 1000)}s`);
+        this.temporaryDisconnectionStartedAt = null;
+      }
+
+      // CRITICAL FIX: Reset QR code count and endSession flag on successful connection
+      this.instance.qrcode.count = 0;
+      this.endSession = false;
+      this.logger.verbose('QR code count and endSession flag reset after successful connection');
+
+      // Reset circuit breaker on successful connection
+      this.circuitBreakerState = 'closed';
+      this.circuitBreakerOpenedAt = null;
+      this.recentFailures = [];
+      this.logger.verbose('Circuit breaker reset after successful connection');
 
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
         this.chatwootService.eventWhatsapp(
@@ -913,12 +1560,12 @@ export class BaileysStartupService extends ChannelStartupService {
         this.syncChatwootLostMessages();
       }
 
-      this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+      // Use sequenced webhook to prevent out-of-order delivery
+      this.sendConnectionUpdateWebhook('open', {
         instance: this.instance.name,
         wuid: this.instance.wuid,
         profileName: await this.getProfileName(),
         profilePictureUrl: this.instance.profilePictureUrl,
-        state: 'open', // Usar valor explícito
         statusReason: this.stateConnection.statusReason,
       });
 
@@ -942,9 +1589,9 @@ export class BaileysStartupService extends ChannelStartupService {
         await this.updateConnectionStatus('connecting');
       }
 
-      this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+      // Use sequenced webhook to prevent out-of-order delivery
+      this.sendConnectionUpdateWebhook('connecting', {
         instance: this.instance.name,
-        state: 'connecting', // Usar valor explícito ao invés de spread
         statusReason: this.stateConnection.statusReason,
       });
     }
@@ -1131,6 +1778,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
     this.isClientReady = false;
+    this.lastEventReceivedAt = Date.now(); // Reset event timer for new connection
+    this.zombieCheckFailures = 0; // Reset zombie detection counter
 
     // Clean up old client before creating new one with robust error handling
     if (this.client) {
@@ -1223,6 +1872,9 @@ export class BaileysStartupService extends ChannelStartupService {
     // Start background stream health check (prevents message loss)
     this.startStreamHealthCheck();
 
+    // Start periodic cache cleanup (prevents memory leaks)
+    this.startCacheCleanup();
+
     this.phoneNumber = number;
 
     return this.client;
@@ -1278,16 +1930,49 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  public async connectToWhatsapp(number?: string): Promise<WASocket> {
+  public async connectToWhatsapp(number?: string, timeout = 120000): Promise<WASocket> {
     try {
+      // CRITICAL FIX: Check if connection is already healthy before forcing reconnect
+      if (this.client && this.stateConnection.state === 'open') {
+        const isHealthy = this.isConnectionReady();
+        if (isHealthy) {
+          this.logger.warn('Connection already healthy - skipping reconnection to prevent unnecessary disconnect');
+          return this.client; // Return existing healthy client
+        }
+        this.logger.warn(
+          `Connection state is 'open' but health check failed (isConnectionReady=${isHealthy}) - proceeding with reconnection`,
+        );
+      }
+
       this.loadChatwoot();
       this.loadSettings();
       this.loadWebhook();
       this.loadProxy();
 
-      return await this.createClient(number);
+      // Add overall connection timeout with Promise.race
+      // CRITICAL FIX: Store timeout ID to cancel if connection succeeds first
+      let timeoutId: NodeJS.Timeout | null = null;
+      const connectionPromise = this.createClient(number);
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(`Connection timeout after ${timeout}ms`)), timeout);
+      });
+
+      try {
+        const result = await Promise.race([connectionPromise, timeoutPromise]);
+        // If connection succeeds, cancel the timeout to prevent memory leak
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+        return result;
+      } catch (error) {
+        // If timeout or connection fails, ensure timeout is cleared
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+        throw error;
+      }
     } catch (error) {
-      this.logger.error(error);
+      this.logger.error(`Connection failed: ${error?.toString()}`);
       throw new InternalServerErrorException(error?.toString());
     }
   }
@@ -1699,9 +2384,26 @@ export class BaileysStartupService extends ChannelStartupService {
 
           // Handle messageStubType 2 (Message absent from node) - cache for retry
           if ((received as any)?.messageStubType === 2 && received.key?.id) {
-            this.logger.warn(`Message with stubType 2 cached for retry: ${received.key.id}`);
+            const jid = received.key.remoteJid;
+            const existingMetadata = this.messageStubRetryMetadata.get(received.key.id);
+            const retryCount = existingMetadata ? existingMetadata.retryCount + 1 : 0;
+
+            this.logger.warn(
+              `[Session Error] stubType 2 message cached for retry | ` +
+              `JID: ${jid} | MessageID: ${received.key.id} | ` +
+              `RetryAttempt: ${retryCount}/${this.MAX_STUB_RETRY_ATTEMPTS}`
+            );
+
             this.pruneMapCache(this.messageStubRetryCache, this.MAX_MESSAGE_STUB_RETRY_CACHE);
+            this.pruneMapCache(this.messageStubRetryMetadata, this.MAX_MESSAGE_STUB_RETRY_CACHE);
+
             this.messageStubRetryCache.set(received.key.id, received);
+            this.messageStubRetryMetadata.set(received.key.id, {
+              retryCount,
+              timestamp: Date.now(),
+              jid,
+              lastError: 'stubType 2 - Message absent from node'
+            });
             continue;
           }
 
@@ -1718,12 +2420,38 @@ export class BaileysStartupService extends ChannelStartupService {
               ].some((err) => param?.includes?.(err)),
             )
           ) {
-            this.logger.warn(`Message ignored with messageStubParameters: ${JSON.stringify(received, null, 2)}`);
-
             // Auto-handle session errors
             const jid = received?.key?.remoteJid;
+            const errorMsg = received.messageStubParameters?.join(', ') || 'Unknown session error';
+
+            // Track error statistics by type
             if (jid) {
-              const errorMsg = received.messageStubParameters?.join(', ') || 'Unknown session error';
+              const stats = this.sessionErrorStats.get(jid) || {
+                badMacCount: 0,
+                noSessionCount: 0,
+                lastErrorType: '',
+                lastErrorTime: Date.now()
+              };
+
+              // Detect error type and update counters
+              const isBadMac = errorMsg.includes('Bad MAC');
+              const isNoSession = errorMsg.includes('No matching sessions') || errorMsg.includes('No session');
+
+              if (isBadMac) stats.badMacCount++;
+              if (isNoSession) stats.noSessionCount++;
+              stats.lastErrorType = isBadMac ? 'Bad MAC' : (isNoSession ? 'No Session' : 'Other');
+              stats.lastErrorTime = Date.now();
+
+              this.pruneMapCache(this.sessionErrorStats, this.MAX_SESSION_ERROR_CACHE);
+              this.sessionErrorStats.set(jid, stats);
+
+              this.logger.warn(
+                `[Session Error] Decryption failed | ` +
+                `JID: ${jid} | MessageID: ${received.key.id} | ` +
+                `Error: ${stats.lastErrorType} | ` +
+                `Stats: BadMAC=${stats.badMacCount}, NoSession=${stats.noSessionCount} | ` +
+                `Details: ${errorMsg.substring(0, 100)}`
+              );
 
               // Check if it's a critical session error that should trigger auto-clear
               const isCriticalError = received.messageStubParameters?.some?.((param) =>
@@ -1733,6 +2461,8 @@ export class BaileysStartupService extends ChannelStartupService {
               if (isCriticalError) {
                 await this.handleSessionError(jid, errorMsg);
               }
+            } else {
+              this.logger.warn(`[Session Error] Message with session error but no JID: ${JSON.stringify(received.key, null, 2)}`);
             }
 
             continue;
@@ -2120,9 +2850,62 @@ export class BaileysStartupService extends ChannelStartupService {
         // Check if this message was cached due to stubType 2 and retry it
         if (key.id && this.messageStubRetryCache.has(key.id)) {
           const cachedMessage = this.messageStubRetryCache.get(key.id);
-          this.messageStubRetryCache.delete(key.id);
+          const metadata = this.messageStubRetryMetadata.get(key.id);
 
-          this.logger.info(`Retrying cached message with stubType 2: ${key.id}`);
+          if (!metadata) {
+            // Fallback: no metadata, just retry once
+            this.messageStubRetryCache.delete(key.id);
+            this.logger.info(`[Retry] stubType 2 message (no metadata) | MessageID: ${key.id}`);
+
+            this.client.ev.emit('messages.upsert', {
+              messages: [{ ...cachedMessage, ...update } as WAMessage],
+              type: 'notify',
+            });
+            continue;
+          }
+
+          const { retryCount, jid } = metadata;
+
+          // Check if max retries exceeded
+          if (retryCount >= this.MAX_STUB_RETRY_ATTEMPTS) {
+            this.messageStubRetryCache.delete(key.id);
+            this.messageStubRetryMetadata.delete(key.id);
+            this.logger.error(
+              `[Retry Failed] Max retry attempts exceeded | ` +
+              `JID: ${jid} | MessageID: ${key.id} | ` +
+              `Attempts: ${retryCount}/${this.MAX_STUB_RETRY_ATTEMPTS}`
+            );
+            continue;
+          }
+
+          this.logger.info(
+            `[Retry] stubType 2 message | ` +
+            `JID: ${jid} | MessageID: ${key.id} | ` +
+            `Attempt: ${retryCount + 1}/${this.MAX_STUB_RETRY_ATTEMPTS}`
+          );
+
+          // Attempt session re-establishment before retry
+          try {
+            if (jid && this.client?.assertSessions) {
+              this.logger.verbose(`[Retry] Re-establishing session for JID: ${jid}`);
+              await this.client.assertSessions([jid], true);
+              this.logger.verbose(`[Retry] Session re-established successfully for JID: ${jid}`);
+            }
+          } catch (sessionError) {
+            this.logger.warn(`[Retry] Failed to re-establish session for ${jid}: ${sessionError.message}`);
+            // Continue with retry anyway - session might resolve itself
+          }
+
+          // Apply exponential backoff delay
+          const delay = this.STUB_RETRY_DELAY_MS * Math.pow(2, retryCount);
+          if (delay > 0) {
+            this.logger.verbose(`[Retry] Waiting ${delay}ms before retry (exponential backoff)`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
+
+          // Clean up cache entries
+          this.messageStubRetryCache.delete(key.id);
+          this.messageStubRetryMetadata.delete(key.id);
 
           // Re-emit as messages.upsert to process normally
           this.client.ev.emit('messages.upsert', {
@@ -2161,6 +2944,12 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         if (key.remoteJid !== 'status@broadcast' && key.id !== undefined) {
+          // Skip processing if remoteJid is undefined (required field for database)
+          if (!key.remoteJid) {
+            this.logger.warn(`Skipping message update - remoteJid is undefined for key.id: ${key.id}`);
+            continue;
+          }
+
           let pollUpdates: any;
 
           if (update.pollUpdates) {
@@ -2176,9 +2965,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const message: any = {
             keyId: key.id,
-            remoteJid: key?.remoteJid,
+            remoteJid: key.remoteJid,
             fromMe: key.fromMe,
-            participant: key?.remoteJid,
+            participant: key?.participant,
             status: status[update.status] ?? 'DELETED',
             pollUpdates,
             instanceId: this.instanceId,
@@ -2378,17 +3167,22 @@ export class BaileysStartupService extends ChannelStartupService {
     // IMPORTANT: Settings are now cached in background to NEVER block event processing
     // This prevents message loss in high-volume scenarios
     this.client.ev.process(async (events) => {
-      if (!this.endSession) {
-        // Debug: Log all event keys to help diagnose missing events
-        const eventKeys = Object.keys(events).filter(key => events[key]);
-        if (eventKeys.length > 0) {
-          this.logger.verbose(`Events received: ${eventKeys.join(', ')}`);
-        }
+      // CRITICAL: Wrap everything in try/catch to prevent uncaught errors from killing event processing
+      try {
+        // Update last event timestamp (for dead connection detection)
+        this.lastEventReceivedAt = Date.now();
 
-        const database = this.configService.get<Database>('DATABASE');
+        if (!this.endSession) {
+          // Debug: Log all event keys to help diagnose missing events
+          const eventKeys = Object.keys(events).filter(key => events[key]);
+          if (eventKeys.length > 0) {
+            this.logger.log(`Events received from Baileys: ${eventKeys.join(', ')}`);
+          }
 
-        // Use background-refreshed cache - NEVER await here to avoid blocking
-        const settings = this.settingsCache;
+          const database = this.configService.get<Database>('DATABASE');
+
+          // Use background-refreshed cache - NEVER await here to avoid blocking
+          const settings = this.settingsCache;
 
         if (events.call) {
           const call = events.call[0];
@@ -2426,6 +3220,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (events['messages.upsert']) {
           const payload = events['messages.upsert'];
+
+          // DIAGNOSTIC: Log to confirm event is being received from Baileys
+          this.logger.log(`messages.upsert event received: ${payload.messages.length} messages, type: ${payload.type}`);
 
           this.messageProcessor.processMessage(payload, settings);
           // this.messageHandle['messages.upsert'](payload, settings);
@@ -2523,6 +3320,12 @@ export class BaileysStartupService extends ChannelStartupService {
           this.labelHandle[Events.LABELS_EDIT](payload);
           return;
         }
+        }
+      } catch (error) {
+        // CRITICAL: Log error but DO NOT let it kill event processing
+        this.logger.error('CRITICAL: Uncaught error in event handler (event processing continues):');
+        this.logger.error(error);
+        // Event processing will continue for next events
       }
     });
   }
@@ -3604,7 +4407,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async processAudioMp4(audio: string) {
-    let inputStream: PassThrough;
+    let inputStream: PassThrough | any; // 'any' for axios stream response
 
     if (isURL(audio)) {
       const response = await axios.get(audio, { responseType: 'stream' });
@@ -3633,6 +4436,30 @@ export class BaileysStartupService extends ChannelStartupService {
 
       const outputChunks: Buffer[] = [];
       let stderrData = '';
+      let isResolved = false; // Track if promise already settled
+
+      // CRITICAL FIX: Cleanup function to prevent memory leaks
+      const cleanup = (killProcess = true) => {
+        if (isResolved) return; // Prevent double cleanup
+        isResolved = true;
+
+        // Destroy input stream (HTTP or PassThrough)
+        if (inputStream && typeof inputStream.destroy === 'function') {
+          inputStream.destroy();
+        }
+
+        // Kill ffmpeg process if still running
+        if (killProcess && ffmpegProcess && !ffmpegProcess.killed) {
+          ffmpegProcess.kill('SIGKILL');
+        }
+
+        // Remove all listeners to prevent memory leaks
+        if (ffmpegProcess) {
+          ffmpegProcess.stdout?.removeAllListeners();
+          ffmpegProcess.stderr?.removeAllListeners();
+          ffmpegProcess.removeAllListeners();
+        }
+      };
 
       ffmpegProcess.stdout.on('data', (chunk) => {
         outputChunks.push(chunk);
@@ -3645,6 +4472,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       ffmpegProcess.on('error', (error) => {
         console.error('Error in ffmpeg process', error);
+        cleanup(true); // Kill process and cleanup
         reject(error);
       });
 
@@ -3652,10 +4480,12 @@ export class BaileysStartupService extends ChannelStartupService {
         if (code === 0) {
           this.logger.verbose('Audio converted to mp4');
           const outputBuffer = Buffer.concat(outputChunks);
+          cleanup(false); // Don't kill, process already closed
           resolve(outputBuffer);
         } else {
           this.logger.error(`ffmpeg exited with code ${code}`);
           this.logger.error(`ffmpeg stderr: ${stderrData}`);
+          cleanup(false); // Don't kill, process already closed
           reject(new Error(`ffmpeg exited with code ${code}: ${stderrData}`));
         }
       });
@@ -3665,8 +4495,28 @@ export class BaileysStartupService extends ChannelStartupService {
       inputStream.on('error', (err) => {
         console.error('Error in inputStream', err);
         ffmpegProcess.stdin.end();
+        cleanup(true); // Kill process and cleanup
         reject(err);
       });
+
+      // Timeout fallback (2 minutes max for audio processing)
+      const timeoutId = setTimeout(() => {
+        this.logger.error('FFmpeg process timeout after 2 minutes');
+        cleanup(true);
+        reject(new Error('FFmpeg processing timeout'));
+      }, 120000);
+
+      // Clear timeout on completion
+      const originalResolve = resolve;
+      const originalReject = reject;
+      resolve = (value) => {
+        clearTimeout(timeoutId);
+        originalResolve(value);
+      };
+      reject = (error) => {
+        clearTimeout(timeoutId);
+        originalReject(error);
+      };
     });
   }
 
@@ -3715,15 +4565,46 @@ export class BaileysStartupService extends ChannelStartupService {
       return new Promise((resolve, reject) => {
         const outputAudioStream = new PassThrough();
         const chunks: Buffer[] = [];
+        let isResolved = false;
+
+        // CRITICAL FIX: Cleanup function to prevent memory leaks
+        const cleanup = () => {
+          if (isResolved) return;
+          isResolved = true;
+
+          // Destroy streams
+          if (inputAudioStream && typeof inputAudioStream.destroy === 'function') {
+            inputAudioStream.destroy();
+          }
+          if (outputAudioStream && typeof outputAudioStream.destroy === 'function') {
+            outputAudioStream.destroy();
+          }
+
+          // Kill ffmpeg command if exists
+          if (command) {
+            try {
+              command.kill('SIGKILL');
+            } catch (e) {
+              // Already killed or finished
+            }
+          }
+
+          // Remove all listeners
+          if (outputAudioStream) {
+            outputAudioStream.removeAllListeners();
+          }
+        };
 
         outputAudioStream.on('data', (chunk) => chunks.push(chunk));
         outputAudioStream.on('end', () => {
           const outputBuffer = Buffer.concat(chunks);
+          cleanup();
           resolve(outputBuffer);
         });
 
         outputAudioStream.on('error', (error) => {
           console.log('error', error);
+          cleanup();
           reject(error);
         });
 
@@ -3767,8 +4648,28 @@ export class BaileysStartupService extends ChannelStartupService {
           .pipe(outputAudioStream, { end: true })
           .on('error', function (error) {
             console.log('error', error);
+            cleanup();
             reject(error);
           });
+
+        // Timeout fallback (3 minutes max for audio processing)
+        const timeoutId = setTimeout(() => {
+          this.logger.error('FFmpeg (fluent-ffmpeg) timeout after 3 minutes');
+          cleanup();
+          reject(new Error('FFmpeg processing timeout'));
+        }, 180000);
+
+        // Clear timeout on completion
+        const originalResolve = resolve;
+        const originalReject = reject;
+        resolve = (value) => {
+          clearTimeout(timeoutId);
+          originalResolve(value);
+        };
+        reject = (error) => {
+          clearTimeout(timeoutId);
+          originalReject(error);
+        };
       });
     }
   }
