@@ -511,7 +511,7 @@ export class InstanceController {
     }
 
     try {
-      this.waMonitor.waInstances[instanceName]?.logoutInstance();
+      await this.waMonitor.waInstances[instanceName]?.logoutInstance();
 
       return { status: 'SUCCESS', error: false, response: { message: 'Instance logged out' } };
     } catch (error) {

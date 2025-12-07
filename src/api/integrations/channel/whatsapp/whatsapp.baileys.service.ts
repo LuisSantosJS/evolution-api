@@ -2368,7 +2368,9 @@ export class BaileysStartupService extends ChannelStartupService {
         // Only process 'notify' and 'append' types (real-time messages)
         // Note: History sync comes through 'messaging-history.set' event, not 'messages.upsert'
         // HOWEVER: In some Baileys versions, fetchMessageHistory might send messages through messages.upsert
-        if (type !== 'notify' && type !== 'append') {
+        // Also process messages sent via API (fromMe: true) regardless of type
+        const hasFromMeMessage = messages.some(m => m.key.fromMe);
+        if (type !== 'notify' && type !== 'append' && !hasFromMeMessage) {
           this.logger.warn(`Ignoring messages with type: ${type}, count=${messages.length}. First message remoteJid: ${messages[0]?.key?.remoteJid}`);
           return;
         }
