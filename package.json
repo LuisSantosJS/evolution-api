@@ -3,7 +3,7 @@
   "version": "2.3.2",
   "description": "Rest api for communication with WhatsApp",
   "main": "./dist/main.js",
-  "type": "commonjs",
+  "type": "module",
   "scripts": {
     "build": "tsc --noEmit && tsup",
     "start": "tsx ./src/main.ts",
