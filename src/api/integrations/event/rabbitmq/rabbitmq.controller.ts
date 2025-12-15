@@ -2,7 +2,7 @@ import { PrismaRepository } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { configService, Log, Rabbitmq } from '@config/env.config';
 import { Logger } from '@config/logger.config';
-import * as amqp from 'amqplib/callback_api';
+import * as amqp from 'amqplib/callback_api.js';
 
 import { EmitData, EventController, EventControllerInterface } from '../event.controller';
 
