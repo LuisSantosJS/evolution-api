@@ -2,6 +2,12 @@ import { ConfigService, Language } from '@config/env.config';
 import fs from 'fs';
 import i18next from 'i18next';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+
+// ESM equivalent of __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const languages = ['en', 'pt-BR', 'es'];
 const translationsPath = path.join(__dirname, 'translations');
@@ -13,7 +19,7 @@ languages.forEach((language) => {
   const languagePath = path.join(translationsPath, `${language}.json`);
   if (fs.existsSync(languagePath)) {
     resources[language] = {
-      translation: require(languagePath),
+      translation: JSON.parse(fs.readFileSync(languagePath, 'utf8')),
     };
   }
 });

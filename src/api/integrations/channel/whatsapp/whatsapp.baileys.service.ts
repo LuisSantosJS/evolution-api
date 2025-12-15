@@ -159,7 +159,8 @@ const groupMetadataCache = new CacheService(new CacheEngine(configService, 'grou
 let ffmpegBinaryPath = '/usr/bin/ffmpeg'; // Default to system ffmpeg (installed via apk in Docker)
 try {
   // Try to load the npm package (works on most platforms)
-  const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+  const ffmpegInstallerModule = await import('@ffmpeg-installer/ffmpeg');
+  const ffmpegInstaller = ffmpegInstallerModule.default;
   if (ffmpegInstaller?.path) {
     ffmpegBinaryPath = ffmpegInstaller.path;
   }
