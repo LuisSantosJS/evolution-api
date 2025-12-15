@@ -759,39 +759,27 @@ export class BaileysStartupService extends ChannelStartupService {
                 return; // Don't disconnect healthy connection
               }
 
-              try {
-                // Reset counter before reconnecting
-                this.zombieCheckFailures = 0;
+              // DISABLED AUTO-RECONNECTION: Only log, do not reconnect or close
+              // Reset counter to prevent spamming logs
+              this.zombieCheckFailures = 0;
 
-                this.logger.error(
-                  `Connection confirmed DEAD (wsState=${wsState}, hasUserId=${hasUserId}). Forcing reconnection...`,
-                );
+              this.logger.error(
+                `⚠️ INACTIVITY DETECTED: Connection idle for ${Math.round(timeSinceLastEvent / 1000)}s (${Math.round(timeSinceLastEvent / 60000)} minutes)`,
+              );
+              this.logger.error(
+                `Connection details: wsState=${wsState} (1=OPEN), hasUserId=${hasUserId}, isClientReady=${isClientReady}`,
+              );
+              this.logger.warn('🔕 AUTO-RECONNECT DISABLED: Connection will remain as-is. Manual intervention required if needed.');
 
-                // Force connection state to close and emit event
-                await this.updateConnectionStatus('close', {
-                  disconnectionAt: new Date(),
-                  disconnectionReasonCode: 408, // Request Timeout
-                  disconnectionObject: JSON.stringify({
-                    reason: 'Zombie connection detected - no events received',
-                    silenceDuration: timeSinceLastEvent,
-                  }),
-                });
-
-                // Send CONNECTION_UPDATE event to notify systems
-                this.sendDataWebhook(Events.CONNECTION_UPDATE, {
-                  instance: this.instance.name,
-                  state: 'close',
-                  statusReason: 408,
-                });
-
-                this.logger.warn('Initiating automatic reconnection for zombie connection...');
-
-                // Trigger reconnection (will be handled by connectionUpdate event)
-                await this.connectToWhatsapp(this.phoneNumber);
-              } catch (error) {
-                this.logger.error('Failed to reconnect zombie connection:');
-                this.logger.error(error);
-              }
+              // Optional: Send webhook notification about inactivity (without changing state)
+              this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+                instance: this.instance.name,
+                state: this.stateConnection.state, // Keep current state
+                statusReason: 408, // Timeout indicator
+                inactivityDetected: true,
+                inactivityDuration: timeSinceLastEvent,
+                message: 'Inactivity detected - no auto-reconnect',
+              });
             }
           }
         } else {
