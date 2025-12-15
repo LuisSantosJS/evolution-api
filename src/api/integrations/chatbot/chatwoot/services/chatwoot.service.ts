@@ -18,7 +18,7 @@ import ChatwootClient, {
   generic_id,
   inbox,
 } from '@figuro/chatwoot-sdk';
-import { request as chatwootRequest } from '@figuro/chatwoot-sdk/dist/core/request';
+import { request as chatwootRequest } from '@figuro/chatwoot-sdk/dist/core/request.js';
 import { Chatwoot as ChatwootModel, Contact as ContactModel, Message as MessageModel } from '@prisma/client';
 import i18next from '@utils/i18n';
 import { sendTelemetry } from '@utils/sendTelemetry';
