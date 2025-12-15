@@ -321,7 +321,15 @@ export class InstanceController {
       }
 
       if (state == 'open') {
-        return await this.connectionState({ instanceName });
+        // Já está conectado - retornar informação clara
+        return {
+          instance: {
+            instanceName: instanceName,
+            status: 'open',
+          },
+          message: 'Instance is already connected',
+          alreadyConnected: true,
+        };
       }
 
       if (state == 'connecting') {

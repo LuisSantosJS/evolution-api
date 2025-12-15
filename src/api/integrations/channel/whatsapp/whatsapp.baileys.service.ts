@@ -518,7 +518,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // 1. Atualizar estado em memória IMEDIATAMENTE (fonte única da verdade)
     this.stateConnection.state = newState;
-    this.logger.verbose(`Connection status updated in memory: ${previousState} -> ${newState}`);
+    this.logger.info(`[${this.instanceName}] Connection status: ${previousState} -> ${newState}`);
 
     // 2. Atualizar banco de dados de forma assíncrona e com debounce
     // Não bloquear a operação principal
@@ -544,8 +544,10 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   ) {
     // Debounce: Se última atualização foi recente e para o mesmo estado, skip
+    // EXCETO para estado "open" que deve sempre atualizar imediatamente
     const now = Date.now();
     if (
+      state !== 'open' && // CORREÇÃO: Não debounce estado "open" para sincronização imediata
       this.lastDatabaseStatusUpdate &&
       this.lastDatabaseStatusUpdate.state === state &&
       now - this.lastDatabaseStatusUpdate.timestamp < this.STATUS_SYNC_DEBOUNCE_MS
@@ -1542,8 +1544,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
       // CRITICAL FIX: Reset QR code count and endSession flag on successful connection
       this.instance.qrcode.count = 0;
+      this.instance.qrcode.base64 = null; // Limpar QR code base64
+      this.instance.qrcode.code = null; // Limpar QR code string
+      this.instance.qrcode.pairingCode = null; // Limpar pairing code
       this.endSession = false;
-      this.logger.verbose('QR code count and endSession flag reset after successful connection');
+      this.logger.verbose('QR code data, count and endSession flag reset after successful connection');
 
       // Reset circuit breaker on successful connection
       this.circuitBreakerState = 'closed';
@@ -1732,10 +1737,10 @@ export class BaileysStartupService extends ChannelStartupService {
       ...browserOptions,
       markOnlineOnConnect: false, // FORÇADO: Bot nunca deve aparecer como online
       retryRequestDelayMs: 1000, // AUMENTADO: 350ms -> 1000ms para maior estabilidade
-      maxMsgRetryCount: 6, // AUMENTADO: 4 -> 6 tentativas para maior confiabilidade
+      maxMsgRetryCount: 3, // REDUZIDO: 6 -> 3 tentativas para evitar comportamento agressivo e ban
       fireInitQueries: false, // DESABILITADO: Evita sincronizações automáticas que bloqueiam mensagens em tempo real
       connectTimeoutMs: 60_000, // AUMENTADO: 30s -> 60s para redes lentas
-      keepAliveIntervalMs: 25_000, // REDUZIDO: 30s -> 25s para detectar desconexões mais rápido
+      keepAliveIntervalMs: 30_000, // RESTAURADO: 25s -> 30s para reduzir tráfego e evitar ban
       qrTimeout: 60_000, // AUMENTADO: 45s -> 60s para dar mais tempo ao usuário
       emitOwnEvents: false,
       defaultQueryTimeoutMs: 60_000, // ADICIONADO: timeout para queries
@@ -2589,10 +2594,16 @@ export class BaileysStartupService extends ChannelStartupService {
             received?.message?.audioMessage;
 
           if (this.localSettings.readMessages && received.key.id !== 'status@broadcast') {
+            // Random delay between 500ms-2s to mimic human reading time
+            const readDelay = Math.floor(Math.random() * 1500) + 500;
+            await new Promise((resolve) => setTimeout(resolve, readDelay));
             await this.client.readMessages([received.key]);
           }
 
           if (this.localSettings.readStatus && received.key.id === 'status@broadcast') {
+            // Random delay between 300ms-1.5s for status reading
+            const statusReadDelay = Math.floor(Math.random() * 1200) + 300;
+            await new Promise((resolve) => setTimeout(resolve, statusReadDelay));
             await this.client.readMessages([received.key]);
           }
 
@@ -3565,9 +3576,14 @@ export class BaileysStartupService extends ChannelStartupService {
 
       if (batches.length === 0) return firstMessage;
 
-      await Promise.allSettled(
-        batches.map(async (batch) => {
-          const messageSent = await this.client.sendMessage(
+      // Send remaining batches serially with delays to avoid spam detection
+      for (const batch of batches) {
+        // Random delay between 1-3 seconds to mimic human behavior
+        const delay = Math.floor(Math.random() * 2000) + 1000;
+        await new Promise((resolve) => setTimeout(resolve, delay));
+
+        try {
+          await this.client.sendMessage(
             sender,
             message['status'].content as unknown as AnyMessageContent,
             {
@@ -3577,10 +3593,11 @@ export class BaileysStartupService extends ChannelStartupService {
               messageId: msgId,
             } as unknown as MiscMessageGenerationOptions,
           );
-
-          return messageSent;
-        }),
-      );
+        } catch (error) {
+          this.logger.error(`Error sending status batch: ${error}`);
+          // Continue with next batch even if one fails
+        }
+      }
 
       return firstMessage;
     }
@@ -5039,7 +5056,31 @@ export class BaileysStartupService extends ChannelStartupService {
       );
       console.log('filteredNumbers', filteredNumbers);
 
-      const verify = await this.client.onWhatsApp(...filteredNumbers);
+      // Batch verification to avoid rate limiting (max 20 numbers per batch)
+      const batchSize = 20;
+      const batches = [];
+      for (let i = 0; i < filteredNumbers.length; i += batchSize) {
+        batches.push(filteredNumbers.slice(i, i + batchSize));
+      }
+
+      let verify: Awaited<ReturnType<typeof this.client.onWhatsApp>> = [];
+      for (const batch of batches) {
+        if (batch.length === 0) continue;
+
+        try {
+          const batchResult = await this.client.onWhatsApp(...batch);
+          verify = verify.concat(batchResult);
+
+          // Add delay between batches to avoid rate limiting (1-2 seconds)
+          if (batches.indexOf(batch) < batches.length - 1) {
+            const delay = Math.floor(Math.random() * 1000) + 1000;
+            await new Promise((resolve) => setTimeout(resolve, delay));
+          }
+        } catch (error) {
+          this.logger.error(`Error verifying batch: ${error}`);
+          // Continue with next batch even if one fails
+        }
+      }
       console.log('verify', verify);
       normalVerifiedUsers = await Promise.all(
         normalUsers.map(async (user) => {
