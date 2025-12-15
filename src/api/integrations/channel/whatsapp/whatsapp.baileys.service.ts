@@ -157,19 +157,24 @@ const groupMetadataCache = new CacheService(new CacheEngine(configService, 'grou
 
 // Configure ffmpeg path - try npm package first, fall back to system ffmpeg for Alpine Linux
 let ffmpegBinaryPath = '/usr/bin/ffmpeg'; // Default to system ffmpeg (installed via apk in Docker)
-try {
-  // Try to load the npm package (works on most platforms)
-  const ffmpegInstallerModule = await import('@ffmpeg-installer/ffmpeg');
-  const ffmpegInstaller = ffmpegInstallerModule.default;
-  if (ffmpegInstaller?.path) {
-    ffmpegBinaryPath = ffmpegInstaller.path;
-  }
-} catch (error) {
-  // Npm package not available (e.g., Alpine Linux musl), use system ffmpeg
-  console.log('[FFmpeg] Using system ffmpeg at /usr/bin/ffmpeg (npm package not available)');
-}
 
-// Configure fluent-ffmpeg to use the correct binary
+// Async IIFE to support both ESM and CJS builds
+(async () => {
+  try {
+    // Try to load the npm package (works on most platforms)
+    const ffmpegInstallerModule = await import('@ffmpeg-installer/ffmpeg');
+    const ffmpegInstaller = ffmpegInstallerModule.default;
+    if (ffmpegInstaller?.path) {
+      ffmpegBinaryPath = ffmpegInstaller.path;
+      ffmpeg.setFfmpegPath(ffmpegBinaryPath);
+    }
+  } catch (error) {
+    // Npm package not available (e.g., Alpine Linux musl), use system ffmpeg
+    console.log('[FFmpeg] Using system ffmpeg at /usr/bin/ffmpeg (npm package not available)');
+  }
+})();
+
+// Configure fluent-ffmpeg to use the correct binary (default or after async load)
 ffmpeg.setFfmpegPath(ffmpegBinaryPath);
 
 // Helper function to check if a JID is a phone number user (compatibility with older Baileys versions)
