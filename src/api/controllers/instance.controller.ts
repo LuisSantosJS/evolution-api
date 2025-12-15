@@ -328,69 +328,113 @@ export class InstanceController {
             status: 'open',
           },
           message: 'Instance is already connected',
+          connected: true,
           alreadyConnected: true,
         };
       }
 
       if (state == 'connecting') {
-        // Opção C: Polling curto + forçar reconnect se necessário
-        // Fase 1: Polling inicial (5 segundos)
-        const maxAttempts = 10; // 5 segundos total (500ms * 10)
+        // Check if QR code already exists
+        const currentQr = instance.qrCode;
+        if (currentQr?.base64) {
+          // Calculate age and add metadata
+          const age = currentQr.timestamp ? Date.now() - currentQr.timestamp : null;
+          const expiresIn = age !== null ? Math.max(0, 20000 - age) : null; // ~20s expiry
+
+          this.logger.verbose(`Returning existing QR code (age: ${age ? Math.round(age / 1000) : 'unknown'}s)`);
+
+          return {
+            ...currentQr,
+            // Add helpful metadata for frontend
+            age: age, // milliseconds since generation
+            expiresIn: expiresIn, // milliseconds until expiry (0 if expired)
+            isExpired: expiresIn !== null && expiresIn <= 0,
+            connected: false, // Still connecting
+          };
+        }
+
+        // No QR code yet, wait for it
+        const maxAttempts = 30; // 15 segundos total (500ms * 30)
         let attempts = 0;
         let qrCode: wa.QrCode;
+
+        this.logger.verbose(`Waiting for QR code generation (state: connecting)...`);
 
         while (attempts < maxAttempts) {
           qrCode = instance.qrCode;
           if (qrCode?.base64) {
-            // QR code gerado com sucesso
-            return qrCode;
+            const age = qrCode.timestamp ? Date.now() - qrCode.timestamp : null;
+            const expiresIn = age !== null ? Math.max(0, 20000 - age) : null;
+
+            this.logger.verbose(`QR code generated after ${attempts * 500}ms`);
+
+            return {
+              ...qrCode,
+              age: age,
+              expiresIn: expiresIn,
+              isExpired: false, // Just generated, definitely not expired
+              connected: false, // Still connecting
+            };
           }
           await delay(500);
           attempts++;
         }
 
-        // Fase 2: Se não gerou QR code, forçar reconnect
-        this.logger.warn(`QR code not generated after ${maxAttempts * 500}ms, forcing reconnect...`);
-        await instance.connectToWhatsapp(number);
-
-        // Fase 3: Polling pós-reconnect (3 segundos)
-        const postReconnectAttempts = 6; // 3 segundos total (500ms * 6)
-        attempts = 0;
-
-        while (attempts < postReconnectAttempts) {
-          qrCode = instance.qrCode;
-          if (qrCode?.base64) {
-            // QR code gerado com sucesso após reconnect
-            return qrCode;
-          }
-          await delay(500);
-          attempts++;
-        }
-
-        // Se ainda não conseguiu, retorna o que tiver
-        return instance.qrCode;
+        // If QR code still not ready after 15 seconds, return error
+        this.logger.error(`QR code not generated after ${maxAttempts * 500}ms - connection may have timed out`);
+        return {
+          error: true,
+          message: 'QR code generation timeout. Please try reconnecting the instance.',
+          connected: false,
+          instance: {
+            instanceName: instanceName,
+            status: state,
+          },
+        };
       }
 
       if (state == 'close') {
+        this.logger.verbose(`Initiating connection for instance ${instanceName}...`);
         await instance.connectToWhatsapp(number);
 
-        // Polling com retry para aguardar geração do QR code (5 segundos)
-        const maxAttempts = 10; // 5 segundos total (500ms * 10)
+        // Wait for QR code with extended timeout (15 seconds total)
+        const maxAttempts = 30; // 15 segundos total (500ms * 30)
         let attempts = 0;
         let qrCode: wa.QrCode;
+
+        this.logger.verbose(`Waiting for QR code generation (state: close -> connecting)...`);
 
         while (attempts < maxAttempts) {
           qrCode = instance.qrCode;
           if (qrCode?.base64) {
-            // QR code gerado com sucesso
-            return qrCode;
+            const age = qrCode.timestamp ? Date.now() - qrCode.timestamp : null;
+            const expiresIn = age !== null ? Math.max(0, 20000 - age) : null;
+
+            this.logger.verbose(`QR code generated successfully after ${attempts * 500}ms`);
+
+            return {
+              ...qrCode,
+              age: age,
+              expiresIn: expiresIn,
+              isExpired: false,
+              connected: false,
+            };
           }
           await delay(500);
           attempts++;
         }
 
-        // Se não conseguiu gerar, retorna o que tiver disponível
-        return instance.qrCode;
+        // If QR code still not ready, return error
+        this.logger.error(`QR code not generated after ${maxAttempts * 500}ms`);
+        return {
+          error: true,
+          message: 'QR code generation timeout. The connection may be taking longer than expected.',
+          connected: false,
+          instance: {
+            instanceName: instanceName,
+            status: instance.connectionStatus?.state || 'unknown',
+          },
+        };
       }
 
       return {
@@ -398,6 +442,7 @@ export class InstanceController {
           instanceName: instanceName,
           status: state,
         },
+        connected: state === 'open',
         qrcode: instance?.qrCode,
       };
     } catch (error) {

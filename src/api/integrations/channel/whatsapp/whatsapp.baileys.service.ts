@@ -301,6 +301,8 @@ export class BaileysStartupService extends ChannelStartupService {
   // Reconnection lock to prevent simultaneous reconnections
   private reconnectLock = false;
   private reconnectLockPromise: Promise<void> | null = null;
+  // Connection lock to prevent simultaneous connection attempts
+  private connectionLock = false;
   private reconnectAttempts = 0;
   private readonly MAX_RECONNECT_DELAY = 30000; // Max 30 seconds
   private readonly BASE_RECONNECT_DELAY = 2000; // Start with 2 seconds
@@ -1009,7 +1011,7 @@ export class BaileysStartupService extends ChannelStartupService {
    * Atomic lock acquisition helper
    * Prevents race conditions by ensuring only one operation at a time
    */
-  private async acquireLock(lockName: 'reconnect' | 'statusUpdate', timeout = 10000): Promise<boolean> {
+  private async acquireLock(lockName: 'reconnect' | 'statusUpdate' | 'connection', timeout = 10000): Promise<boolean> {
     const startTime = Date.now();
 
     if (lockName === 'reconnect') {
@@ -1032,6 +1034,16 @@ export class BaileysStartupService extends ChannelStartupService {
       }
       this.statusUpdateLock = true;
       return true;
+    } else if (lockName === 'connection') {
+      while (this.connectionLock) {
+        if (Date.now() - startTime > timeout) {
+          this.logger.warn(`Failed to acquire ${lockName} lock after ${timeout}ms - another connection attempt in progress`);
+          return false;
+        }
+        await delay(100);
+      }
+      this.connectionLock = true;
+      return true;
     }
 
     return false;
@@ -1040,11 +1052,13 @@ export class BaileysStartupService extends ChannelStartupService {
   /**
    * Release lock
    */
-  private releaseLock(lockName: 'reconnect' | 'statusUpdate'): void {
+  private releaseLock(lockName: 'reconnect' | 'statusUpdate' | 'connection'): void {
     if (lockName === 'reconnect') {
       this.reconnectLock = false;
     } else if (lockName === 'statusUpdate') {
       this.statusUpdateLock = false;
+    } else if (lockName === 'connection') {
+      this.connectionLock = false;
     }
   }
 
@@ -1165,29 +1179,35 @@ export class BaileysStartupService extends ChannelStartupService {
         this.instance.qrcode.pairingCode = null;
       }
 
-      qrcode.toDataURL(qr, optsQrcode, (error, base64) => {
-        if (error) {
-          this.logger.error('Qrcode generate failed:' + error.toString());
-          return;
-        }
-
-        this.instance.qrcode.base64 = base64;
-        this.instance.qrcode.code = qr;
-
-        this.sendDataWebhook(Events.QRCODE_UPDATED, {
-          qrcode: { instance: this.instance.name, pairingCode: this.instance.qrcode.pairingCode, code: qr, base64 },
+      // Convert callback to Promise to ensure QR code is ready before continuing
+      const base64 = await new Promise<string>((resolve, reject) => {
+        qrcode.toDataURL(qr, optsQrcode, (error, result) => {
+          if (error) {
+            this.logger.error('Qrcode generate failed:' + error.toString());
+            reject(error);
+            return;
+          }
+          resolve(result);
         });
-
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-          this.chatwootService.eventWhatsapp(
-            Events.QRCODE_UPDATED,
-            { instanceName: this.instance.name, instanceId: this.instanceId },
-            {
-              qrcode: { instance: this.instance.name, pairingCode: this.instance.qrcode.pairingCode, code: qr, base64 },
-            },
-          );
-        }
       });
+
+      this.instance.qrcode.base64 = base64;
+      this.instance.qrcode.code = qr;
+      this.instance.qrcode.timestamp = Date.now(); // Track when QR code was generated
+
+      this.sendDataWebhook(Events.QRCODE_UPDATED, {
+        qrcode: { instance: this.instance.name, pairingCode: this.instance.qrcode.pairingCode, code: qr, base64 },
+      });
+
+      if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+        this.chatwootService.eventWhatsapp(
+          Events.QRCODE_UPDATED,
+          { instanceName: this.instance.name, instanceId: this.instanceId },
+          {
+            qrcode: { instance: this.instance.name, pairingCode: this.instance.qrcode.pairingCode, code: qr, base64 },
+          },
+        );
+      }
 
       qrcodeTerminal.generate(qr, { small: true }, (qrcode) =>
         this.logger.log(
@@ -1547,6 +1567,7 @@ export class BaileysStartupService extends ChannelStartupService {
       this.instance.qrcode.base64 = null; // Limpar QR code base64
       this.instance.qrcode.code = null; // Limpar QR code string
       this.instance.qrcode.pairingCode = null; // Limpar pairing code
+      this.instance.qrcode.timestamp = null; // Limpar timestamp do QR code
       this.endSession = false;
       this.logger.verbose('QR code data, count and endSession flag reset after successful connection');
 
@@ -1575,16 +1596,16 @@ export class BaileysStartupService extends ChannelStartupService {
       });
 
       // Mark client as ready after all initialization is complete
-      // Small delay to ensure all async operations are done
+      // Delay increased to account for fireInitQueries and slow proxies
       // CORREÇÃO: Armazenar timeout para permitir limpeza
       if (this.clientReadyTimeout) {
         clearTimeout(this.clientReadyTimeout);
       }
       this.clientReadyTimeout = setTimeout(() => {
         this.isClientReady = true;
-        this.logger.info('Client marked as ready for operations');
+        this.logger.info('Client marked as ready for operations after initialization queries');
         this.clientReadyTimeout = null;
-      }, 1500);
+      }, 10000); // Increased from 1.5s to 10s for fireInitQueries completion
     }
 
     if (connection === 'connecting') {
@@ -1738,7 +1759,7 @@ export class BaileysStartupService extends ChannelStartupService {
       markOnlineOnConnect: false, // FORÇADO: Bot nunca deve aparecer como online
       retryRequestDelayMs: 1000, // AUMENTADO: 350ms -> 1000ms para maior estabilidade
       maxMsgRetryCount: 3, // REDUZIDO: 6 -> 3 tentativas para evitar comportamento agressivo e ban
-      fireInitQueries: false, // DESABILITADO: Evita sincronizações automáticas que bloqueiam mensagens em tempo real
+      fireInitQueries: true, // HABILITADO: Necessário para finalizar conexão após escanear QR code
       connectTimeoutMs: 60_000, // AUMENTADO: 30s -> 60s para redes lentas
       keepAliveIntervalMs: 30_000, // RESTAURADO: 25s -> 30s para reduzir tráfego e evitar ban
       qrTimeout: 60_000, // AUMENTADO: 45s -> 60s para dar mais tempo ao usuário
@@ -1935,18 +1956,23 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  public async connectToWhatsapp(number?: string, timeout = 120000): Promise<WASocket> {
+  public async connectToWhatsapp(number?: string, timeout = 300000): Promise<WASocket> {
+    // Acquire connection lock to prevent multiple simultaneous connection attempts
+    const lockAcquired = await this.acquireLock('connection', 10000);
+    if (!lockAcquired) {
+      this.logger.warn('Another connection attempt is already in progress - returning existing client or throwing error');
+      if (this.client) {
+        return this.client;
+      }
+      throw new InternalServerErrorException('Connection attempt already in progress, please wait');
+    }
+
     try {
-      // CRITICAL FIX: Check if connection is already healthy before forcing reconnect
+      // CRITICAL FIX: If state is 'open', always trust it and return existing client
+      // Don't check isConnectionReady() as it may fail during initialization queries
       if (this.client && this.stateConnection.state === 'open') {
-        const isHealthy = this.isConnectionReady();
-        if (isHealthy) {
-          this.logger.warn('Connection already healthy - skipping reconnection to prevent unnecessary disconnect');
-          return this.client; // Return existing healthy client
-        }
-        this.logger.warn(
-          `Connection state is 'open' but health check failed (isConnectionReady=${isHealthy}) - proceeding with reconnection`,
-        );
+        this.logger.info('Connection state is open - returning existing client to avoid unnecessary reconnection');
+        return this.client;
       }
 
       this.loadChatwoot();
@@ -1954,31 +1980,21 @@ export class BaileysStartupService extends ChannelStartupService {
       this.loadWebhook();
       this.loadProxy();
 
-      // Add overall connection timeout with Promise.race
-      // CRITICAL FIX: Store timeout ID to cancel if connection succeeds first
-      let timeoutId: NodeJS.Timeout | null = null;
-      const connectionPromise = this.createClient(number);
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timeoutId = setTimeout(() => reject(new Error(`Connection timeout after ${timeout}ms`)), timeout);
-      });
+      // Create client (returns socket immediately, doesn't wait for connection)
+      const client = await this.createClient(number);
 
-      try {
-        const result = await Promise.race([connectionPromise, timeoutPromise]);
-        // If connection succeeds, cancel the timeout to prevent memory leak
-        if (timeoutId) {
-          clearTimeout(timeoutId);
-        }
-        return result;
-      } catch (error) {
-        // If timeout or connection fails, ensure timeout is cleared
-        if (timeoutId) {
-          clearTimeout(timeoutId);
-        }
-        throw error;
-      }
+      // CRITICAL FIX: Don't wait for 'open' state - let connection happen asynchronously
+      // The connection will complete in the background via connection.update events
+      // Timeout only applies to socket creation, not to QR code scanning
+      this.logger.info('WhatsApp client created successfully, connection will complete asynchronously');
+
+      return client;
     } catch (error) {
       this.logger.error(`Connection failed: ${error?.toString()}`);
       throw new InternalServerErrorException(error?.toString());
+    } finally {
+      // Always release the connection lock
+      this.releaseLock('connection');
     }
   }
 

@@ -44,6 +44,7 @@ export declare namespace wa {
     pairingCode?: string;
     base64?: string;
     code?: string;
+    timestamp?: number; // Timestamp when QR code was generated (for expiry checking)
   };
 
   export type Instance = {
