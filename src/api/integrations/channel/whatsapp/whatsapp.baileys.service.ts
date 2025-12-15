@@ -1596,16 +1596,16 @@ export class BaileysStartupService extends ChannelStartupService {
       });
 
       // Mark client as ready after all initialization is complete
-      // Delay increased to account for fireInitQueries and slow proxies
+      // Delay to ensure all async operations complete (especially with slow proxies)
       // CORREÇÃO: Armazenar timeout para permitir limpeza
       if (this.clientReadyTimeout) {
         clearTimeout(this.clientReadyTimeout);
       }
       this.clientReadyTimeout = setTimeout(() => {
         this.isClientReady = true;
-        this.logger.info('Client marked as ready for operations after initialization queries');
+        this.logger.info('Client marked as ready for operations');
         this.clientReadyTimeout = null;
-      }, 10000); // Increased from 1.5s to 10s for fireInitQueries completion
+      }, 5000); // 5s delay to ensure connection is stable
     }
 
     if (connection === 'connecting') {
@@ -1759,7 +1759,7 @@ export class BaileysStartupService extends ChannelStartupService {
       markOnlineOnConnect: false, // FORÇADO: Bot nunca deve aparecer como online
       retryRequestDelayMs: 1000, // AUMENTADO: 350ms -> 1000ms para maior estabilidade
       maxMsgRetryCount: 3, // REDUZIDO: 6 -> 3 tentativas para evitar comportamento agressivo e ban
-      fireInitQueries: true, // HABILITADO: Necessário para finalizar conexão após escanear QR code
+      fireInitQueries: false, // DESABILITADO: Evita bloqueios e permite messaging-history.set funcionar corretamente
       connectTimeoutMs: 60_000, // AUMENTADO: 30s -> 60s para redes lentas
       keepAliveIntervalMs: 30_000, // RESTAURADO: 25s -> 30s para reduzir tráfego e evitar ban
       qrTimeout: 60_000, // AUMENTADO: 45s -> 60s para dar mais tempo ao usuário
@@ -3239,10 +3239,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (events['messaging-history.set']) {
           const payload = events['messaging-history.set'];
-          this.logger.verbose(`messaging-history.set event received: ${payload.messages?.length || 0} messages, syncType: ${payload.syncType}`);
+          this.logger.log(`📦 messaging-history.set event received: ${payload.messages?.length || 0} messages, ${payload.chats?.length || 0} chats, syncType: ${payload.syncType}, progress: ${payload.progress}%`);
           // Process async to not block realtime events
           this.messageHandle['messaging-history.set'](payload).catch((error) => {
-            this.logger.error('Error processing messaging-history.set:');
+            this.logger.error('❌ Error processing messaging-history.set:');
             this.logger.error(error);
           });
         }
