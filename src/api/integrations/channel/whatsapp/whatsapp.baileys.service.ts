@@ -304,6 +304,10 @@ export class BaileysStartupService extends ChannelStartupService {
   private wsCloseListener: ((code: number, reason: Buffer) => void) | null = null;
   private wsPongListener: (() => void) | null = null;
 
+  // CRITICAL FIX: Track if event handler has been registered to prevent duplicates
+  // Without this flag, every reconnection registers a new handler, causing QR code issues
+  private eventHandlerRegistered = false;
+
   // Reconnection lock to prevent simultaneous reconnections
   private reconnectLock = false;
   private reconnectLockPromise: Promise<void> | null = null;
@@ -953,6 +957,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private cleanupEventListeners() {
     try {
+      // CRITICAL FIX: Reset event handler flag to allow re-registration after cleanup
+      // This is essential when the instance is destroyed and recreated
+      this.eventHandlerRegistered = false;
+      this.logger.verbose('Event handler flag reset');
+
       // Remove WebSocket event listeners
       if (this.client?.ws) {
         if (this.wsCallListener) {
@@ -1124,496 +1133,193 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
+    // ═══════════════════════════════════════════════════════════
+    // QR CODE - SIMPLIFIED & FAST
+    // ═══════════════════════════════════════════════════════════
     if (qr) {
-      if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
+      // Check QR code limit
+      if (this.instance.qrcode.count >= this.configService.get<QrCode>('QRCODE').LIMIT) {
+        this.endSession = true;
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
-          message: 'QR code limit reached, please login again',
+          message: 'QR code limit reached',
           statusCode: DisconnectReason.badSession,
         });
-
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-          this.chatwootService.eventWhatsapp(
-            Events.QRCODE_UPDATED,
-            { instanceName: this.instance.name, instanceId: this.instanceId },
-            { message: 'QR code limit reached, please login again', statusCode: DisconnectReason.badSession },
-          );
-        }
-
-        // Use sequenced webhook to prevent out-of-order delivery
-        this.sendConnectionUpdateWebhook('close', {
-          instance: this.instance.name,
-          statusReason: DisconnectReason.connectionClosed,
-          wuid: this.instance.wuid,
-          profileName: await this.getProfileName(),
-          profilePictureUrl: this.instance.profilePictureUrl,
-          message: 'QR code limit reached',
-        }, true); // Force send even if duplicate
-
-        this.endSession = true;
-
         return this.eventEmitter.emit('no.connection', this.instance.name);
       }
 
       this.instance.qrcode.count++;
-      this.connectionMetrics.qrCodeGeneratedCount++;
 
-      const color = this.configService.get<QrCode>('QRCODE').COLOR;
-
+      // QR code options
       const optsQrcode: QRCodeToDataURLOptions = {
         margin: 3,
         scale: 4,
         errorCorrectionLevel: 'H',
-        color: { light: '#ffffff', dark: color },
+        color: { light: '#ffffff', dark: this.configService.get<QrCode>('QRCODE').COLOR },
       };
 
+      // Request pairing code (non-blocking)
       if (this.phoneNumber) {
-        await delay(1000);
-        this.instance.qrcode.pairingCode = await this.client.requestPairingCode(this.phoneNumber);
+        this.client.requestPairingCode(this.phoneNumber)
+          .then(code => {
+            this.instance.qrcode.pairingCode = code;
+            this.logger.log(`Pairing code: ${code}`);
+          })
+          .catch(err => this.logger.error(`Failed to get pairing code: ${err.message}`));
       } else {
         this.instance.qrcode.pairingCode = null;
       }
 
-      // Convert callback to Promise to ensure QR code is ready before continuing
-      const base64 = await new Promise<string>((resolve, reject) => {
-        qrcode.toDataURL(qr, optsQrcode, (error, result) => {
-          if (error) {
-            this.logger.error('Qrcode generate failed:' + error.toString());
-            reject(error);
-            return;
-          }
-          resolve(result);
-        });
-      });
+      // Generate QR code (non-blocking)
+      qrcode.toDataURL(qr, optsQrcode, (error, base64) => {
+        if (error) {
+          this.logger.error('QR code generation failed: ' + error.toString());
+          return;
+        }
 
-      this.instance.qrcode.base64 = base64;
-      this.instance.qrcode.code = qr;
-      this.instance.qrcode.timestamp = Date.now(); // Track when QR code was generated
+        this.instance.qrcode.base64 = base64;
+        this.instance.qrcode.code = qr;
 
-      this.sendDataWebhook(Events.QRCODE_UPDATED, {
-        qrcode: { instance: this.instance.name, pairingCode: this.instance.qrcode.pairingCode, code: qr, base64 },
-      });
-
-      if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-        this.chatwootService.eventWhatsapp(
-          Events.QRCODE_UPDATED,
-          { instanceName: this.instance.name, instanceId: this.instanceId },
-          {
-            qrcode: { instance: this.instance.name, pairingCode: this.instance.qrcode.pairingCode, code: qr, base64 },
+        // Send webhook (non-blocking)
+        this.sendDataWebhook(Events.QRCODE_UPDATED, {
+          qrcode: {
+            instance: this.instance.name,
+            pairingCode: this.instance.qrcode.pairingCode,
+            code: qr,
+            base64
           },
+        });
+
+        // Log QR code to terminal
+        qrcodeTerminal.generate(qr, { small: true }, (qrcodeStr) =>
+          this.logger.log(`\n{ instance: ${this.instance.name}, qrcodeCount: ${this.instance.qrcode.count} }\n${qrcodeStr}`)
         );
-      }
+      });
 
-      qrcodeTerminal.generate(qr, { small: true }, (qrcode) =>
-        this.logger.log(
-          `\n{ instance: ${this.instance.name} pairingCode: ${this.instance.qrcode.pairingCode}, qrcodeCount: ${this.instance.qrcode.count} }\n` +
-            qrcode,
-        ),
-      );
-
-      // Usar método atômico para atualizar status
-      await this.updateConnectionStatus('connecting');
+      // Update status (non-blocking)
+      this.updateConnectionStatus('connecting');
     }
 
-    // Atualizar statusReason ANTES de processar mudanças de estado
+    // ═══════════════════════════════════════════════════════════
+    // CONNECTION STATE CHANGES
+    // ═══════════════════════════════════════════════════════════
     if (connection) {
       this.stateConnection.statusReason = (lastDisconnect?.error as Boom)?.output?.statusCode ?? 200;
     }
 
-    // Processar mudança de estado baseado no valor de 'connection'
+    // ═══════════════════════════════════════════════════════════
+    // CONNECTION CLOSE - SIMPLIFIED
+    // ═══════════════════════════════════════════════════════════
     if (connection === 'close') {
-      // Track disconnection metrics
-      this.connectionMetrics.totalDisconnections++;
-      this.connectionMetrics.lastDisconnectionAt = new Date();
-
-      // Calculate uptime if we were connected
-      if (this.connectionMetrics.lastConnectionAt) {
-        this.connectionMetrics.connectionUptime =
-          this.connectionMetrics.lastDisconnectionAt.getTime() -
-          this.connectionMetrics.lastConnectionAt.getTime();
-      }
-
-      // Mark client as not ready when connection closes
       this.isClientReady = false;
 
-      // Clear any pending clientReady timeout
+      // Clear pending clientReady timeout
       if (this.clientReadyTimeout) {
         clearTimeout(this.clientReadyTimeout);
         this.clientReadyTimeout = null;
       }
 
-      // Detect if this is a temporary disconnection (was connected recently)
-      const now = Date.now();
-      const wasRecentlyConnected = this.connectionMetrics.lastConnectionAt &&
-        (now - this.connectionMetrics.lastConnectionAt.getTime()) < 30000; // Within last 30 seconds
-
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+      const shouldReconnect = ![DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406].includes(statusCode);
 
-      // Códigos que NÃO devem reconnectar automaticamente:
-      // - loggedOut: usuário fez logout manualmente
-      // - forbidden: conta banida/bloqueada pelo WhatsApp
-      // - 402: Payment Required (conta com problemas de pagamento)
-      // - 406: Not Acceptable (versão incompatível)
-      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
-      const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+      this.logger.info(`Connection closed (statusCode: ${statusCode}, shouldReconnect: ${shouldReconnect})`);
 
-      // Handle temporary disconnections differently from permanent ones
-      // If we were recently connected and should reconnect, this is likely a temporary network issue
-      if (wasRecentlyConnected && shouldReconnect) {
-        // Record disconnection start time if not already tracking
-        if (!this.temporaryDisconnectionStartedAt) {
-          this.temporaryDisconnectionStartedAt = now;
-          this.logger.verbose(`Temporary disconnection detected (was connected ${Math.round((now - this.connectionMetrics.lastConnectionAt!.getTime()) / 1000)}s ago)`);
-        }
+      // Update connection status (non-blocking)
+      this.updateConnectionStatus('close', {
+        disconnectionAt: new Date(),
+        disconnectionReasonCode: statusCode,
+        disconnectionObject: JSON.stringify(lastDisconnect),
+      });
 
-        const disconnectionDuration = now - this.temporaryDisconnectionStartedAt;
-
-        // Send 'reconnecting' webhook immediately to inform clients this is temporary
-        this.sendConnectionUpdateWebhook('reconnecting', {
-          instance: this.instance.name,
-          statusReason: statusCode,
-          wuid: this.instance.wuid,
-          profileName: await this.getProfileName(),
-          profilePictureUrl: this.instance.profilePictureUrl,
-          isTemporary: true,
-          disconnectionDuration,
-          disconnectionReason: (lastDisconnect?.error as Boom)?.message || 'Connection lost',
-        }, true); // Force send
-
-        // Set up debounce timer: only send 'close' if still disconnected after 5 seconds
-        if (this.closeEventDebounceTimeout) {
-          clearTimeout(this.closeEventDebounceTimeout);
-        }
-
-        this.closeEventDebounceTimeout = setTimeout(() => {
-          // Check if still disconnected after debounce period
-          if (this.stateConnection.state !== 'open') {
-            const finalDuration = Date.now() - this.temporaryDisconnectionStartedAt!;
-            this.logger.warn(`Disconnection persisted for ${Math.round(finalDuration / 1000)}s - sending 'close' event`);
-
-            this.sendConnectionUpdateWebhook('close', {
-              instance: this.instance.name,
-              statusReason: statusCode,
-              wuid: this.instance.wuid,
-              profileName: this.getProfileName(),
-              profilePictureUrl: this.instance.profilePictureUrl,
-              isTemporary: false,
-              disconnectionDuration: finalDuration,
-              disconnectionReason: (lastDisconnect?.error as Boom)?.message || 'Connection closed',
-            }, true);
-          } else {
-            this.logger.verbose('Connection recovered before close debounce - close event cancelled');
-          }
-          // Reset temporary disconnection tracking
-          this.temporaryDisconnectionStartedAt = null;
-          this.closeEventDebounceTimeout = null;
-        }, this.CLOSE_EVENT_DEBOUNCE_MS);
-      } else if (!shouldReconnect) {
-        // Permanent disconnection (logout, ban, etc.) - send 'close' immediately
-        this.logger.info(`Permanent disconnection detected (statusCode: ${statusCode})`);
-        this.sendConnectionUpdateWebhook('close', {
-          instance: this.instance.name,
-          statusReason: statusCode,
-          wuid: this.instance.wuid,
-          profileName: await this.getProfileName(),
-          profilePictureUrl: this.instance.profilePictureUrl,
-          isTemporary: false,
-          disconnectionDuration: 0,
-          disconnectionReason: (lastDisconnect?.error as Boom)?.message || 'Permanent disconnection',
-        }, true);
-        // Reset temporary disconnection tracking
-        this.temporaryDisconnectionStartedAt = null;
-        if (this.closeEventDebounceTimeout) {
-          clearTimeout(this.closeEventDebounceTimeout);
-          this.closeEventDebounceTimeout = null;
-        }
-      }
-
-      // Track failure for circuit breaker
-      if (shouldReconnect) {
-        const now = Date.now();
-        this.recentFailures.push(now);
-        // Clean old failures outside the window
-        this.recentFailures = this.recentFailures.filter((timestamp) => now - timestamp < this.CIRCUIT_BREAKER_WINDOW_MS);
-
-        // Check if circuit breaker should open
-        if (
-          this.circuitBreakerState === 'closed' &&
-          this.recentFailures.length >= this.CIRCUIT_BREAKER_FAILURE_THRESHOLD
-        ) {
-          this.circuitBreakerState = 'open';
-          this.circuitBreakerOpenedAt = now;
-          this.connectionMetrics.circuitBreakerOpenCount++;
-          this.logger.error(
-            `Circuit breaker OPENED after ${this.recentFailures.length} failures in ${this.CIRCUIT_BREAKER_WINDOW_MS / 1000}s`,
-          );
-        }
-      }
-
-      // Check circuit breaker state
-      if (this.circuitBreakerState === 'open') {
-        const timeSinceOpened = Date.now() - (this.circuitBreakerOpenedAt || 0);
-        if (timeSinceOpened >= this.CIRCUIT_BREAKER_TIMEOUT_MS) {
-          // Try half-open state
-          this.circuitBreakerState = 'half-open';
-          this.logger.warn(
-            `Circuit breaker entering HALF-OPEN state after ${this.CIRCUIT_BREAKER_TIMEOUT_MS / 1000}s timeout`,
-          );
-        } else {
-          this.logger.warn(
-            `Circuit breaker is OPEN - blocking reconnection attempt (retry in ${Math.ceil((this.CIRCUIT_BREAKER_TIMEOUT_MS - timeSinceOpened) / 1000)}s)`,
-          );
-          // Update status but don't reconnect
-          await this.updateConnectionStatus('close', {
-            disconnectionAt: new Date(),
-            disconnectionReasonCode: statusCode,
-            disconnectionObject: JSON.stringify(lastDisconnect),
-          });
-          return;
-        }
-      }
-
-      // Reset reconnect attempts if last successful connection was over 1 hour ago
-      if (this.lastSuccessfulConnection && Date.now() - this.lastSuccessfulConnection >= this.RECONNECT_ATTEMPTS_RESET_MS) {
-        this.logger.info(
-          `Resetting reconnect attempts counter (last successful connection was over ${this.RECONNECT_ATTEMPTS_RESET_MS / 1000}s ago)`,
-        );
-        this.reconnectAttempts = 0;
-      }
+      // Send webhooks (non-blocking)
+      this.sendDataWebhook(Events.STATUS_INSTANCE, {
+        instance: this.instance.name,
+        status: 'closed',
+        statusCode,
+      });
 
       if (shouldReconnect) {
-        // Check max reconnection attempts
-        if (this.reconnectAttempts >= this.MAX_RECONNECT_ATTEMPTS) {
-          this.logger.error(
-            `Maximum reconnection attempts reached (${this.MAX_RECONNECT_ATTEMPTS}). Stopping automatic reconnection.`,
-          );
-          // Use sequenced webhook to prevent out-of-order delivery
-          this.sendConnectionUpdateWebhook('close', {
-            instance: this.instance.name,
-            statusReason: statusCode,
-            wuid: this.instance.wuid,
-            profileName: await this.getProfileName(),
-            profilePictureUrl: this.instance.profilePictureUrl,
-            message: `Maximum reconnection attempts (${this.MAX_RECONNECT_ATTEMPTS}) reached`,
-          }, true); // Force send
-          await this.updateConnectionStatus('close', {
-            disconnectionAt: new Date(),
-            disconnectionReasonCode: statusCode,
-            disconnectionObject: JSON.stringify(lastDisconnect),
-          });
-          return;
-        }
-
-        // Acquire lock atomically with timeout
-        const lockAcquired = await this.acquireLock('reconnect', 5000);
-        if (!lockAcquired) {
-          this.logger.warn('Failed to acquire reconnection lock - another reconnection may be in progress');
-          return;
-        }
-
+        // Simple reconnection with 2 second delay
         this.reconnectAttempts++;
-        this.connectionMetrics.totalReconnectionAttempts++;
+        const delay = 2000;
 
-        // Calculate exponential backoff delay: 2s, 4s, 8s, 16s, 30s (max)
-        const exponentialDelay = Math.min(
-          this.BASE_RECONNECT_DELAY * Math.pow(2, this.reconnectAttempts - 1),
-          this.MAX_RECONNECT_DELAY,
-        );
+        this.logger.info(`Scheduling reconnection in ${delay}ms (attempt #${this.reconnectAttempts})`);
 
-        this.logger.info(
-          `Initiating reconnection with lock... (attempt #${this.reconnectAttempts}/${this.MAX_RECONNECT_ATTEMPTS}, delay: ${exponentialDelay}ms, circuit: ${this.circuitBreakerState})`,
-        );
-
-        // Atualizar status para 'close' atomicamente
-        await this.updateConnectionStatus('close', {
-          disconnectionAt: new Date(),
-          disconnectionReasonCode: statusCode,
-          disconnectionObject: JSON.stringify(lastDisconnect),
-        });
-
-        try {
-          // Exponential backoff delay to give WhatsApp server time to clear session state
-          // Critical for preventing "Bad MAC" and "MessageCounterError" after reconnection
-          await delay(exponentialDelay);
-          await this.connectToWhatsapp(this.phoneNumber);
-
-          // If half-open, successful connection will close the circuit in connection === 'open' handler
-          this.connectionMetrics.totalSuccessfulReconnections++;
-        } catch (error) {
-          this.logger.error(`Reconnection failed (attempt #${this.reconnectAttempts}/${this.MAX_RECONNECT_ATTEMPTS}): ${error.message}`);
-          this.connectionMetrics.totalFailedReconnections++;
-          // Don't reset attempts - let exponential backoff continue
-          // If half-open, reopen the circuit on failure
-          if (this.circuitBreakerState === 'half-open') {
-            this.circuitBreakerState = 'open';
-            this.circuitBreakerOpenedAt = Date.now();
-            this.connectionMetrics.circuitBreakerOpenCount++;
-            this.logger.error('Circuit breaker reopened after failed half-open attempt');
+        setTimeout(async () => {
+          try {
+            await this.connectToWhatsapp(this.phoneNumber);
+          } catch (error) {
+            this.logger.error(`Reconnection failed: ${error.message}`);
           }
-        } finally {
-          this.releaseLock('reconnect');
-        }
+        }, delay);
       } else {
-        // Código padrão para erros que não devem reconnectar
-        this.sendDataWebhook(Events.STATUS_INSTANCE, {
-          instance: this.instance.name,
-          status: 'closed',
-          disconnectionAt: new Date(),
-          disconnectionReasonCode: statusCode,
-          disconnectionObject: JSON.stringify(lastDisconnect),
-        });
-
-        // Usar método atômico para atualizar status
-        await this.updateConnectionStatus('close', {
-          disconnectionAt: new Date(),
-          disconnectionReasonCode: statusCode,
-          disconnectionObject: JSON.stringify(lastDisconnect),
-        });
-
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-          this.chatwootService.eventWhatsapp(
-            Events.STATUS_INSTANCE,
-            { instanceName: this.instance.name, instanceId: this.instanceId },
-            { instance: this.instance.name, status: 'closed' },
-          );
-        }
-
+        // Permanent disconnection - cleanup
+        this.logger.info('Permanent disconnection - cleaning up');
         this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
         this.client?.ws?.close();
         this.client.end(new Error('Close connection'));
-
-        this.sendDataWebhook(Events.CONNECTION_UPDATE, {
-          instance: this.instance.name,
-          state: 'close', // Usar valor explícito
-          statusReason: this.stateConnection.statusReason,
-        });
       }
     }
 
+    // ═══════════════════════════════════════════════════════════
+    // CONNECTION OPEN - SIMPLIFIED
+    // ═══════════════════════════════════════════════════════════
     if (connection === 'open') {
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
-      try {
-        const profilePic = await this.profilePicture(this.instance.wuid);
-        this.instance.profilePictureUrl = profilePic.profilePictureUrl;
-      } catch (error) {
-        this.instance.profilePictureUrl = null;
-      }
-      const formattedWuid = this.instance.wuid.split('@')[0].padEnd(30, ' ');
-      const formattedName = this.instance.name;
-      this.logger.info(
-        `
-        ┌──────────────────────────────┐
-        │    CONNECTED TO WHATSAPP     │
-        └──────────────────────────────┘`.replace(/^ +/gm, '  '),
-      );
-      this.logger.info(
-        `
-        wuid: ${formattedWuid}
-        name: ${formattedName}
-      `,
-      );
 
-      // Usar método atômico para atualizar status + dados adicionais
-      await this.updateConnectionStatus('open', {
-        ownerJid: this.instance.wuid,
-        profileName: (await this.getProfileName()) as string,
-        profilePicUrl: this.instance.profilePictureUrl,
+      // Get profile picture (non-blocking)
+      this.profilePicture(this.instance.wuid)
+        .then(pic => this.instance.profilePictureUrl = pic.profilePictureUrl)
+        .catch(() => this.instance.profilePictureUrl = null);
+
+      this.logger.info(`✅ CONNECTED TO WHATSAPP - ${this.instance.name} (${this.instance.wuid})`);
+
+      // Reset QR code and session flags
+      this.instance.qrcode.count = 0;
+      this.instance.qrcode.base64 = null;
+      this.instance.qrcode.code = null;
+      this.instance.qrcode.pairingCode = null;
+      this.endSession = false;
+      this.reconnectAttempts = 0;
+
+      // Update connection status (non-blocking)
+      this.getProfileName().then(profileName => {
+        this.updateConnectionStatus('open', {
+          ownerJid: this.instance.wuid,
+          profileName: profileName as string,
+          profilePicUrl: this.instance.profilePictureUrl,
+        });
       });
 
-      // Track connection metrics
-      this.connectionMetrics.totalConnections++;
-      const connectionTime = new Date();
-      this.connectionMetrics.lastConnectionAt = connectionTime;
+      // Send webhooks (non-blocking)
+      this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+        instance: this.instance.name,
+        state: 'open',
+        wuid: this.instance.wuid,
+      });
 
-      // Calculate average connection duration if we have a last disconnection
-      if (this.connectionMetrics.lastDisconnectionAt) {
-        const lastDuration = this.connectionMetrics.lastDisconnectionAt.getTime() -
-          (this.connectionMetrics.lastConnectionAt ? this.connectionMetrics.lastConnectionAt.getTime() : 0);
-
-        if (lastDuration > 0) {
-          // Running average
-          this.connectionMetrics.averageConnectionDuration =
-            (this.connectionMetrics.averageConnectionDuration * (this.connectionMetrics.totalConnections - 1) + lastDuration) /
-            this.connectionMetrics.totalConnections;
-        }
-      }
-
-      // Reset reconnect attempts counter on successful connection
-      this.reconnectAttempts = 0;
-      this.lastSuccessfulConnection = Date.now();
-      this.logger.verbose('Reconnection attempts counter reset');
-
-      // Cancel any pending close event debounce timer
-      if (this.closeEventDebounceTimeout) {
-        clearTimeout(this.closeEventDebounceTimeout);
-        this.closeEventDebounceTimeout = null;
-        this.logger.verbose('Cancelled pending close event (connection recovered)');
-      }
-
-      // Reset temporary disconnection tracking
-      if (this.temporaryDisconnectionStartedAt) {
-        const recoveryTime = Date.now() - this.temporaryDisconnectionStartedAt;
-        this.logger.info(`Connection recovered from temporary disconnection after ${Math.round(recoveryTime / 1000)}s`);
-        this.temporaryDisconnectionStartedAt = null;
-      }
-
-      // CRITICAL FIX: Reset QR code count and endSession flag on successful connection
-      this.instance.qrcode.count = 0;
-      this.instance.qrcode.base64 = null; // Limpar QR code base64
-      this.instance.qrcode.code = null; // Limpar QR code string
-      this.instance.qrcode.pairingCode = null; // Limpar pairing code
-      this.instance.qrcode.timestamp = null; // Limpar timestamp do QR code
-      this.endSession = false;
-      this.logger.verbose('QR code data, count and endSession flag reset after successful connection');
-
-      // Reset circuit breaker on successful connection
-      this.circuitBreakerState = 'closed';
-      this.circuitBreakerOpenedAt = null;
-      this.recentFailures = [];
-      this.logger.verbose('Circuit breaker reset after successful connection');
-
+      // Sync Chatwoot lost messages (non-blocking)
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-        this.chatwootService.eventWhatsapp(
-          Events.CONNECTION_UPDATE,
-          { instanceName: this.instance.name, instanceId: this.instanceId },
-          { instance: this.instance.name, status: 'open' },
-        );
         this.syncChatwootLostMessages();
       }
 
-      // Use sequenced webhook to prevent out-of-order delivery
-      this.sendConnectionUpdateWebhook('open', {
-        instance: this.instance.name,
-        wuid: this.instance.wuid,
-        profileName: await this.getProfileName(),
-        profilePictureUrl: this.instance.profilePictureUrl,
-        statusReason: this.stateConnection.statusReason,
-      });
-
-      // Mark client as ready after all initialization is complete
-      // Delay to ensure all async operations complete (especially with slow proxies)
-      // CORREÇÃO: Armazenar timeout para permitir limpeza
+      // Mark client as ready (with delay for stability)
       if (this.clientReadyTimeout) {
         clearTimeout(this.clientReadyTimeout);
       }
       this.clientReadyTimeout = setTimeout(() => {
         this.isClientReady = true;
-        this.logger.info('Client marked as ready for operations');
+        this.logger.info('Client ready for operations');
         this.clientReadyTimeout = null;
-      }, 5000); // 5s delay to ensure connection is stable
+      }, 3000); // 3s delay
     }
 
+    // ═══════════════════════════════════════════════════════════
+    // CONNECTION CONNECTING
+    // ═══════════════════════════════════════════════════════════
     if (connection === 'connecting') {
-      // CORREÇÃO: Atualizar state para 'connecting' se ainda não foi atualizado via QR
-      // Isso garante que state está correto mesmo se evento connecting vier sem QR
       if (this.stateConnection.state !== 'connecting') {
-        await this.updateConnectionStatus('connecting');
+        this.updateConnectionStatus('connecting');
       }
-
-      // Use sequenced webhook to prevent out-of-order delivery
-      this.sendConnectionUpdateWebhook('connecting', {
-        instance: this.instance.name,
-        statusReason: this.stateConnection.statusReason,
-      });
     }
   }
 
@@ -1885,6 +1591,10 @@ export class BaileysStartupService extends ChannelStartupService {
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
     }
+
+    // CRITICAL: Always reset flag before registering handler to ensure it works with new client
+    this.eventHandlerRegistered = false;
+    this.logger.verbose('Event handler flag reset before registration');
 
     // Setup event handler FIRST
     this.eventHandler();
@@ -3202,6 +2912,16 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler() {
+    // CRITICAL FIX: Prevent duplicate event handler registration
+    // Every reconnection would register a new handler without this check, causing QR code issues
+    if (this.eventHandlerRegistered) {
+      this.logger.warn('⚠️ Event handler already registered, skipping duplicate registration');
+      return;
+    }
+
+    this.eventHandlerRegistered = true;
+    this.logger.info('✅ Registering Baileys event handler for new client');
+
     // IMPORTANT: Settings are now cached in background to NEVER block event processing
     // This prevents message loss in high-volume scenarios
     this.client.ev.process(async (events) => {
@@ -3214,7 +2934,7 @@ export class BaileysStartupService extends ChannelStartupService {
           // Debug: Log all event keys to help diagnose missing events
           const eventKeys = Object.keys(events).filter(key => events[key]);
           if (eventKeys.length > 0) {
-            this.logger.log(`Events received from Baileys: ${eventKeys.join(', ')}`);
+            this.logger.log(`📥 Events received from Baileys: ${eventKeys.join(', ')}`);
           }
 
           const database = this.configService.get<Database>('DATABASE');
