@@ -1195,8 +1195,8 @@ export class BaileysStartupService extends ChannelStartupService {
         );
       });
 
-      // Update status (non-blocking)
-      this.updateConnectionStatus('connecting');
+      // Update status (WITH await to prevent race conditions)
+      await this.updateConnectionStatus('connecting');
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -1223,8 +1223,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
       this.logger.info(`Connection closed (statusCode: ${statusCode}, shouldReconnect: ${shouldReconnect})`);
 
-      // Update connection status (non-blocking)
-      this.updateConnectionStatus('close', {
+      // Update connection status (WITH await to prevent race conditions)
+      await this.updateConnectionStatus('close', {
         disconnectionAt: new Date(),
         disconnectionReasonCode: statusCode,
         disconnectionObject: JSON.stringify(lastDisconnect),
@@ -1238,17 +1238,39 @@ export class BaileysStartupService extends ChannelStartupService {
       });
 
       if (shouldReconnect) {
-        // Simple reconnection with 2 second delay
-        this.reconnectAttempts++;
-        const delay = 2000;
+        // Check max reconnection attempts
+        const MAX_RECONNECT_ATTEMPTS = 10;
+        if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+          this.logger.error(`Maximum reconnection attempts (${MAX_RECONNECT_ATTEMPTS}) reached - stopping`);
+          this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+            instance: this.instance.name,
+            state: 'close',
+            message: 'Max reconnection attempts reached',
+          });
+          return;
+        }
 
-        this.logger.info(`Scheduling reconnection in ${delay}ms (attempt #${this.reconnectAttempts})`);
+        // Acquire reconnection lock to prevent simultaneous reconnects
+        const lockAcquired = await this.acquireLock('reconnect', 5000);
+        if (!lockAcquired) {
+          this.logger.warn('Reconnection already in progress - skipping');
+          return;
+        }
+
+        this.reconnectAttempts++;
+
+        // Exponential backoff: 2s, 4s, 8s, 16s, 30s (max)
+        const delay = Math.min(2000 * Math.pow(2, this.reconnectAttempts - 1), 30000);
+
+        this.logger.info(`Scheduling reconnection in ${delay}ms (attempt #${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
 
         setTimeout(async () => {
           try {
             await this.connectToWhatsapp(this.phoneNumber);
           } catch (error) {
             this.logger.error(`Reconnection failed: ${error.message}`);
+          } finally {
+            this.releaseLock('reconnect');
           }
         }, delay);
       } else {
@@ -1281,13 +1303,12 @@ export class BaileysStartupService extends ChannelStartupService {
       this.endSession = false;
       this.reconnectAttempts = 0;
 
-      // Update connection status (non-blocking)
-      this.getProfileName().then(profileName => {
-        this.updateConnectionStatus('open', {
-          ownerJid: this.instance.wuid,
-          profileName: profileName as string,
-          profilePicUrl: this.instance.profilePictureUrl,
-        });
+      // Update connection status (WITH await to prevent race conditions)
+      const profileName = await this.getProfileName();
+      await this.updateConnectionStatus('open', {
+        ownerJid: this.instance.wuid,
+        profileName: profileName as string,
+        profilePicUrl: this.instance.profilePictureUrl,
       });
 
       // Send webhooks (non-blocking)
@@ -1318,7 +1339,7 @@ export class BaileysStartupService extends ChannelStartupService {
     // ═══════════════════════════════════════════════════════════
     if (connection === 'connecting') {
       if (this.stateConnection.state !== 'connecting') {
-        this.updateConnectionStatus('connecting');
+        await this.updateConnectionStatus('connecting');
       }
     }
   }
