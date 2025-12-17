@@ -151,7 +151,7 @@ export class ChannelStartupService {
     this.localSettings.alwaysOnline = data?.alwaysOnline;
     this.localSettings.readMessages = data?.readMessages;
     this.localSettings.readStatus = data?.readStatus;
-    this.localSettings.syncFullHistory = data?.syncFullHistory;
+    this.localSettings.syncFullHistory = true; // Always enabled
     this.localSettings.wavoipToken = data?.wavoipToken;
   }
 
@@ -189,7 +189,7 @@ export class ChannelStartupService {
     this.localSettings.alwaysOnline = data?.alwaysOnline;
     this.localSettings.readMessages = data?.readMessages;
     this.localSettings.readStatus = data?.readStatus;
-    this.localSettings.syncFullHistory = data?.syncFullHistory;
+    this.localSettings.syncFullHistory = true; // Always enabled
     this.localSettings.wavoipToken = data?.wavoipToken;
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {

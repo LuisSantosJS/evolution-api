@@ -28,6 +28,16 @@ export class BaileysMessageProcessor {
           this.messageCount++;
           this.lastMessageTime = Date.now();
           this.processorLogs.log(`Processing batch of ${messages.length} messages (total processed: ${this.messageCount})`);
+
+          // CRITICAL: Monitor stream health - detect if observers are missing
+          if (this.messageSubject.observers.length === 0) {
+            this.processorLogs.error('⚠️ CRITICAL: NO OBSERVERS on messageSubject! Stream may be dead!');
+          }
+
+          // CRITICAL: Detect backpressure - warn if processing is too slow
+          if (this.messageSubject.observed && (this.messageSubject as any)._events?.length > 100) {
+            this.processorLogs.warn(`⚠️ HIGH BACKPRESSURE: ${(this.messageSubject as any)._events?.length} queued events`);
+          }
         }),
         concatMap(({ messages, type, requestId, settings }) =>
           from(onMessageReceive({ messages, type, requestId }, settings)).pipe(

@@ -290,13 +290,6 @@ export class BaileysStartupService extends ChannelStartupService {
   private cacheCleanupInterval: NodeJS.Timeout | null = null;
   private readonly CACHE_CLEANUP_INTERVAL = 300000; // 5 minutes - cleanup expired entries
 
-  // Track last event received to detect dead connections
-  private lastEventReceivedAt: number = Date.now();
-  private readonly MAX_EVENT_SILENCE_MS = 300000; // 5 minutes - warning threshold
-  private readonly CRITICAL_EVENT_SILENCE_MS = 600000; // 10 minutes - critical threshold for auto-reconnect
-  private zombieCheckFailures: number = 0; // Count consecutive failures
-  private readonly MAX_ZOMBIE_FAILURES = 3; // Require 3 consecutive checks before reconnecting
-
   // Event listener callbacks stored for cleanup
   private wsCallListener: ((packet: any) => void) | null = null;
   private wsCallAckListener: ((packet: any) => void) | null = null;
@@ -622,15 +615,110 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
-    this.cleanupEventListeners();
-    this.messageProcessor.onDestroy();
-    await this.client?.logout('Log out instance: ' + this.instanceName);
+    this.logger.info(`🔄 Starting fresh logout and reconnect for instance: ${this.instanceName}`);
 
-    this.client?.ws?.close();
+    try {
+      // Step 1: Clean up event listeners and processors
+      this.logger.verbose('Step 1: Cleaning up event listeners and processors');
+      this.cleanupEventListeners();
+      this.messageProcessor.onDestroy();
 
-    const sessionExists = await this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } });
-    if (sessionExists) {
-      await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
+      // Step 2: Logout from WhatsApp
+      this.logger.verbose('Step 2: Logging out from WhatsApp');
+      await this.client?.logout('Fresh restart - clearing all sessions: ' + this.instanceName);
+
+      // Step 3: Close WebSocket connection
+      this.logger.verbose('Step 3: Closing WebSocket connection');
+      this.client?.ws?.close();
+
+      // Step 4: Delete session from database
+      this.logger.verbose('Step 4: Deleting session from database');
+      const sessionExists = await this.prismaRepository.session.findFirst({
+        where: { sessionId: this.instanceId }
+      });
+
+      if (sessionExists) {
+        await this.prismaRepository.session.delete({
+          where: { sessionId: this.instanceId }
+        });
+        this.logger.verbose('✅ Session deleted from database');
+      }
+
+      // Step 5: Clear auth state completely (like fresh install)
+      this.logger.verbose('Step 5: Clearing auth state');
+      if (this.instance.authState) {
+        try {
+          // Clear all auth keys from cache/storage
+          const cache = this.configService.get<CacheConf>('CACHE');
+
+          if (cache?.REDIS?.ENABLED && cache?.REDIS?.SAVE_INSTANCES) {
+            // Clear Redis auth state
+            await this.cache.delete(this.instance.id);
+            this.logger.verbose('✅ Redis auth state cleared');
+          }
+
+          // Clear database auth state
+          const db = this.configService.get<Database>('DATABASE');
+          if (db.SAVE_DATA.INSTANCE) {
+            const authKeys = await this.prismaRepository.session.findMany({
+              where: { sessionId: this.instanceId }
+            });
+
+            if (authKeys.length > 0) {
+              await this.prismaRepository.session.deleteMany({
+                where: { sessionId: this.instanceId }
+              });
+              this.logger.verbose(`✅ Deleted ${authKeys.length} auth keys from database`);
+            }
+          }
+        } catch (error) {
+          this.logger.warn(`Failed to clear some auth state: ${error.message}`);
+        }
+      }
+
+      // Step 6: Reset instance state
+      this.logger.verbose('Step 6: Resetting instance state');
+      this.endSession = false;
+      this.isClientReady = false;
+      this.reconnectAttempts = 0;
+      this.eventHandlerRegistered = false;
+
+      // Reset QR code
+      this.instance.qrcode = {
+        count: 0,
+        base64: null,
+        code: null,
+        pairingCode: null
+      };
+
+      // Reset connection state
+      this.stateConnection = {
+        state: 'close',
+        statusReason: 200
+      };
+
+      // Step 7: Update database status
+      this.logger.verbose('Step 7: Updating connection status to close');
+      await this.updateConnectionStatus('close', {
+        disconnectionAt: new Date(),
+        disconnectionReasonCode: 200,
+        disconnectionObject: JSON.stringify({ reason: 'Manual logout - preparing fresh restart' })
+      });
+
+      // Step 8: Wait a bit to ensure everything is cleaned up
+      this.logger.verbose('Step 8: Waiting for cleanup to complete...');
+      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      // Step 9: Reconnect as fresh instance (will generate new QR code)
+      this.logger.info('🔄 Step 9: Reconnecting as fresh instance...');
+      await this.connectToWhatsapp();
+
+      this.logger.info('✅ Logout and fresh reconnect completed successfully!');
+      this.logger.info('📱 New QR code should be generated for pairing');
+
+    } catch (error) {
+      this.logger.error(`❌ Error during logout and reconnect: ${error.message}`);
+      throw error;
     }
   }
 
@@ -700,121 +788,6 @@ export class BaileysStartupService extends ChannelStartupService {
           });
 
           this.logger.warn('Message processor stream RECREATED successfully');
-        }
-
-        // Check 2: Detect "zombie" connections - connected but no events
-        const timeSinceLastEvent = Date.now() - this.lastEventReceivedAt;
-
-        // Check if connection appears open but is actually degraded
-        const isDegraded = this.stateConnection.state === 'open' && timeSinceLastEvent > this.MAX_EVENT_SILENCE_MS;
-        const wasDegraded = this.stateConnection.state === 'connecting' && timeSinceLastEvent > this.MAX_EVENT_SILENCE_MS;
-
-        if (isDegraded || wasDegraded) {
-          // Stage 1: Warning (5 minutes)
-          if (timeSinceLastEvent < this.CRITICAL_EVENT_SILENCE_MS) {
-            this.logger.warn(
-              `WARNING: No events received for ${Math.round(timeSinceLastEvent / 1000)}s. Connection may be degraded.`,
-            );
-            this.zombieCheckFailures++;
-
-            // Only update status on FIRST detection (when state is still 'open')
-            if (this.stateConnection.state === 'open') {
-              // Update status to 'connecting' to indicate degraded connection
-              await this.updateConnectionStatus('connecting', {
-                disconnectionReasonCode: 503, // Service Unavailable
-                disconnectionObject: JSON.stringify({
-                  reason: 'Connection degraded - no events received',
-                  silenceDuration: timeSinceLastEvent,
-                  stage: 'warning',
-                }),
-              });
-
-              // Notify via webhook that connection is degraded
-              this.sendDataWebhook(Events.CONNECTION_UPDATE, {
-                instance: this.instance.name,
-                state: 'connecting',
-                statusReason: 503,
-              });
-            }
-          }
-          // Stage 2: Critical (10+ minutes) - requires multiple consecutive failures
-          else {
-            this.zombieCheckFailures++;
-            this.logger.error(
-              `ZOMBIE CONNECTION DETECTED: No events for ${Math.round(timeSinceLastEvent / 1000)}s (failure #${this.zombieCheckFailures}/${this.MAX_ZOMBIE_FAILURES})`,
-            );
-
-            // Only reconnect after multiple consecutive failures (SAFETY MECHANISM)
-            if (this.zombieCheckFailures >= this.MAX_ZOMBIE_FAILURES) {
-              this.logger.error(
-                `CRITICAL: Connection is definitively DEAD after ${this.zombieCheckFailures} consecutive checks. Validating...`,
-              );
-
-              // CRITICAL FIX: Validate connection is actually dead before disconnecting
-              const wsState = (this.client?.ws as any)?.readyState;
-              const hasUserId = !!this.client?.user?.id;
-              const isClientReady = this.isClientReady;
-
-              this.logger.warn(
-                `Connection health check: wsState=${wsState} (1=OPEN), hasUserId=${hasUserId}, isClientReady=${isClientReady}`,
-              );
-
-              // If WebSocket is OPEN and user is authenticated, connection might be healthy
-              if (wsState === 1 && hasUserId && isClientReady) {
-                this.logger.warn(
-                  'ZOMBIE FALSE POSITIVE: Connection appears healthy despite no events. Resetting zombie counter and keeping connection.',
-                );
-                this.zombieCheckFailures = 0;
-                this.lastEventReceivedAt = Date.now(); // Reset event timer
-                return; // Don't disconnect healthy connection
-              }
-
-              // DISABLED AUTO-RECONNECTION: Only log, do not reconnect or close
-              // Reset counter to prevent spamming logs
-              this.zombieCheckFailures = 0;
-
-              this.logger.error(
-                `⚠️ INACTIVITY DETECTED: Connection idle for ${Math.round(timeSinceLastEvent / 1000)}s (${Math.round(timeSinceLastEvent / 60000)} minutes)`,
-              );
-              this.logger.error(
-                `Connection details: wsState=${wsState} (1=OPEN), hasUserId=${hasUserId}, isClientReady=${isClientReady}`,
-              );
-              this.logger.warn('🔕 AUTO-RECONNECT DISABLED: Connection will remain as-is. Manual intervention required if needed.');
-
-              // Optional: Send webhook notification about inactivity (without changing state)
-              this.sendDataWebhook(Events.CONNECTION_UPDATE, {
-                instance: this.instance.name,
-                state: this.stateConnection.state, // Keep current state
-                statusReason: 408, // Timeout indicator
-                inactivityDetected: true,
-                inactivityDuration: timeSinceLastEvent,
-                message: 'Inactivity detected - no auto-reconnect',
-              });
-            }
-          }
-        } else {
-          // Reset failure counter if events are being received normally
-          if (this.zombieCheckFailures > 0) {
-            this.logger.info(`Connection recovered - resetting zombie check counter (was ${this.zombieCheckFailures})`);
-            this.zombieCheckFailures = 0;
-
-            // If connection was marked as degraded (connecting), restore to open
-            if (this.stateConnection.state === 'connecting') {
-              await this.updateConnectionStatus('open', {
-                disconnectionReasonCode: 200, // OK
-                disconnectionObject: JSON.stringify({
-                  reason: 'Connection recovered - events being received normally',
-                }),
-              });
-
-              // Notify via webhook that connection recovered
-              this.sendDataWebhook(Events.CONNECTION_UPDATE, {
-                instance: this.instance.name,
-                state: 'open',
-                statusReason: 200,
-              });
-            }
-          }
         }
       } catch (error) {
         this.logger.error('Error during stream health check:');
@@ -1349,9 +1322,17 @@ export class BaileysStartupService extends ChannelStartupService {
       const webMessageInfo = (await this.prismaRepository.message.findMany({
         where: { instanceId: this.instanceId, key: { path: ['id'], equals: key.id } },
       })) as unknown as proto.IWebMessageInfo[];
+
+      // CRITICAL FIX: Check if message exists to prevent undefined errors
+      if (!webMessageInfo || webMessageInfo.length === 0 || !webMessageInfo[0]) {
+        this.logger.verbose(`[getMessage] Message not found in DB: ${key.id}`);
+        return full ? null : { conversation: '' };
+      }
+
       if (full) {
         return webMessageInfo[0];
       }
+
       if (webMessageInfo[0].message?.pollCreationMessage) {
         const messageSecretBase64 = webMessageInfo[0].message?.messageContextInfo?.messageSecret;
 
@@ -1367,8 +1348,9 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       }
 
-      return webMessageInfo[0].message;
+      return webMessageInfo[0].message || { conversation: '' };
     } catch (error) {
+      this.logger.error(`[getMessage] Error: ${error.message}`);
       return { conversation: '' };
     }
   }
@@ -1525,8 +1507,6 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
     this.isClientReady = false;
-    this.lastEventReceivedAt = Date.now(); // Reset event timer for new connection
-    this.zombieCheckFailures = 0; // Reset zombie detection counter
 
     // Clean up old client before creating new one with robust error handling
     if (this.client) {
@@ -2126,13 +2106,15 @@ export class BaileysStartupService extends ChannelStartupService {
         // Log message type for diagnostics
         this.logger.verbose(`messages.upsert received: type=${type}, count=${messages.length}, requestId=${requestId}`);
 
-        // Only process 'notify' and 'append' types (real-time messages)
-        // Note: History sync comes through 'messaging-history.set' event, not 'messages.upsert'
-        // HOWEVER: In some Baileys versions, fetchMessageHistory might send messages through messages.upsert
+        // Process realtime messages: 'notify', 'append', 'historic' (from fetchMessageHistory)
+        // Note: Full history sync comes through 'messaging-history.set' event
+        // IMPORTANT: fetchMessageHistory sends messages through messages.upsert with type='historic'
         // Also process messages sent via API (fromMe: true) regardless of type
         const hasFromMeMessage = messages.some(m => m.key.fromMe);
-        if (type !== 'notify' && type !== 'append' && !hasFromMeMessage) {
-          this.logger.warn(`Ignoring messages with type: ${type}, count=${messages.length}. First message remoteJid: ${messages[0]?.key?.remoteJid}`);
+        const isValidType = ['notify', 'append', 'historic'].includes(type);
+
+        if (!isValidType && !hasFromMeMessage) {
+          this.logger.warn(`Ignoring messages with unknown type: ${type}, count=${messages.length}. First message remoteJid: ${messages[0]?.key?.remoteJid}`);
           return;
         }
 
@@ -2946,22 +2928,29 @@ export class BaileysStartupService extends ChannelStartupService {
     // IMPORTANT: Settings are now cached in background to NEVER block event processing
     // This prevents message loss in high-volume scenarios
     this.client.ev.process(async (events) => {
+      // CRITICAL: Timeout wrapper to prevent event processing from hanging forever
+      const EVENT_PROCESSING_TIMEOUT = 30000; // 30 seconds
+      const processingStartTime = Date.now();
+
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`Event processing timeout after ${EVENT_PROCESSING_TIMEOUT}ms`)), EVENT_PROCESSING_TIMEOUT)
+      );
+
       // CRITICAL: Wrap everything in try/catch to prevent uncaught errors from killing event processing
       try {
-        // Update last event timestamp (for dead connection detection)
-        this.lastEventReceivedAt = Date.now();
+        await Promise.race([
+          (async () => {
+            if (!this.endSession) {
+              // Debug: Log all event keys to help diagnose missing events
+              const eventKeys = Object.keys(events).filter(key => events[key]);
+              if (eventKeys.length > 0) {
+                this.logger.log(`📥 Events received from Baileys: ${eventKeys.join(', ')}`);
+              }
 
-        if (!this.endSession) {
-          // Debug: Log all event keys to help diagnose missing events
-          const eventKeys = Object.keys(events).filter(key => events[key]);
-          if (eventKeys.length > 0) {
-            this.logger.log(`📥 Events received from Baileys: ${eventKeys.join(', ')}`);
-          }
+              const database = this.configService.get<Database>('DATABASE');
 
-          const database = this.configService.get<Database>('DATABASE');
-
-          // Use background-refreshed cache - NEVER await here to avoid blocking
-          const settings = this.settingsCache;
+              // Use background-refreshed cache - NEVER await here to avoid blocking
+              const settings = this.settingsCache;
 
         if (events.call) {
           const call = events.call[0];
@@ -2990,10 +2979,14 @@ export class BaileysStartupService extends ChannelStartupService {
         if (events['messaging-history.set']) {
           const payload = events['messaging-history.set'];
           this.logger.log(`📦 messaging-history.set event received: ${payload.messages?.length || 0} messages, ${payload.chats?.length || 0} chats, syncType: ${payload.syncType}, progress: ${payload.progress}%`);
-          // Process async to not block realtime events
-          this.messageHandle['messaging-history.set'](payload).catch((error) => {
-            this.logger.error('❌ Error processing messaging-history.set:');
-            this.logger.error(error);
+
+          // CRITICAL: Process in background to NEVER block realtime events
+          // Using setImmediate ensures this runs AFTER current event loop iteration
+          setImmediate(() => {
+            this.messageHandle['messaging-history.set'](payload).catch((error) => {
+              this.logger.error('❌ Error processing messaging-history.set:');
+              this.logger.error(error);
+            });
           });
         }
 
@@ -3100,10 +3093,26 @@ export class BaileysStartupService extends ChannelStartupService {
           return;
         }
         }
+          })(), // End of async function for Promise.race
+          timeoutPromise
+        ]);
+
+        // Log processing time for performance monitoring
+        const processingTime = Date.now() - processingStartTime;
+        if (processingTime > 5000) {
+          this.logger.warn(`⚠️ Slow event processing: ${processingTime}ms`);
+        }
+
       } catch (error) {
         // CRITICAL: Log error but DO NOT let it kill event processing
-        this.logger.error('CRITICAL: Uncaught error in event handler (event processing continues):');
-        this.logger.error(error);
+        const processingTime = Date.now() - processingStartTime;
+
+        if (error.message?.includes('timeout')) {
+          this.logger.error(`❌ EVENT PROCESSING TIMEOUT after ${processingTime}ms - this may cause event loss!`);
+        } else {
+          this.logger.error('CRITICAL: Uncaught error in event handler (event processing continues):');
+          this.logger.error(error);
+        }
         // Event processing will continue for next events
       }
     });
@@ -5464,12 +5473,29 @@ export class BaileysStartupService extends ChannelStartupService {
     return null;
   }
 
+  /**
+   * On-Demand History Sync
+   * Uses sock.fetchMessageHistory to request history beyond initial sync
+   *
+   * @param data - Sync configuration
+   * @returns Promise with sync status
+   *
+   * @example
+   * // Sync specific chat
+   * { remoteJid: "5511999999999", limit: 100 }
+   *
+   * // Sync multiple chats
+   * { remoteJids: ["5511999999999", "5511888888888"], limit: 50 }
+   *
+   * // Sync all recent chats
+   * { limit: 100 }
+   */
   public async syncMessages(data: SyncMessagesDto) {
     const limit = data.limit || 100; // Default to 100 messages per chat
+    const forceSync = data.forceSync || false;
 
-    // If remoteJid is provided, sync only that chat
+    // OPTION 1: Sync single chat (remoteJid)
     if (data.remoteJid) {
-      // Validate and get the correct remoteJid
       const validatedNumbers = await this.whatsappNumber({ numbers: [data.remoteJid] });
 
       if (!validatedNumbers || validatedNumbers.length === 0) {
@@ -5478,120 +5504,193 @@ export class BaileysStartupService extends ChannelStartupService {
 
       const numberInfo = validatedNumbers[0];
 
-      // Check if number exists on WhatsApp
       if (!numberInfo.exists) {
         throw new NotFoundException(`Number ${data.remoteJid} is not on WhatsApp`);
       }
 
-      // Skip groups
       if (numberInfo.jid.includes('@g.us')) {
         throw new BadRequestException('Groups are not supported for synchronization');
       }
 
-      // Only accept @s.whatsapp.net
       if (!numberInfo.jid.includes('@s.whatsapp.net')) {
         throw new BadRequestException('Only individual chats are supported (@s.whatsapp.net)');
       }
 
       const validRemoteJid = numberInfo.jid;
 
-      // Process in background
-      this.syncSingleChat(validRemoteJid, limit).catch((error) => {
+      // Process in background with retry
+      this.syncSingleChat(validRemoteJid, limit, forceSync).catch((error) => {
         this.logger.error(`Background sync error for ${validRemoteJid}: ${error.toString()}`);
       });
 
       return {
         success: true,
-        message: 'Synchronization started in background',
-        validatedNumber: validRemoteJid
+        message: `On-demand history sync started using sock.fetchMessageHistory`,
+        chat: validRemoteJid,
+        limit,
+        forceSync,
+        note: 'Messages will be delivered via messaging-history.set event and webhook (MESSAGES_SET)'
       };
     }
 
-    // If no remoteJid provided, sync all individual chats
-    // Start background process and return immediately
+    // OPTION 2: Sync multiple chats (remoteJids)
+    if (data.remoteJids && data.remoteJids.length > 0) {
+      const validatedNumbers = await this.whatsappNumber({ numbers: data.remoteJids });
+
+      if (!validatedNumbers || validatedNumbers.length === 0) {
+        throw new NotFoundException('No valid numbers found');
+      }
+
+      const validChats = validatedNumbers
+        .filter(n => n.exists && n.jid.includes('@s.whatsapp.net'))
+        .map(n => n.jid);
+
+      if (validChats.length === 0) {
+        throw new NotFoundException('No valid individual chats found');
+      }
+
+      // Process all chats in background
+      this.syncMultipleChats(validChats, limit, forceSync).catch((error) => {
+        this.logger.error(`Background batch sync error: ${error.toString()}`);
+      });
+
+      return {
+        success: true,
+        message: `On-demand history sync started for ${validChats.length} chats`,
+        chats: validChats,
+        limit,
+        forceSync,
+        note: 'Messages will be delivered via messaging-history.set event and webhook (MESSAGES_SET)'
+      };
+    }
+
+    // OPTION 3: Sync all recent individual chats
     this.syncRecentChats(limit).catch((error) => {
       this.logger.error(`Background sync error: ${error.toString()}`);
     });
 
     return {
       success: true,
-      message: 'Synchronization started in background for all individual chats'
+      message: 'On-demand history sync started for all recent individual chats',
+      limit,
+      note: 'Messages will be delivered via messaging-history.set event and webhook (MESSAGES_SET)'
     };
   }
 
-  private async syncSingleChat(remoteJid: string, limit: number): Promise<void> {
-    try {
-      // Get the last message from the chat to use as reference
-      const lastMessage = await this.getLastMessage(remoteJid);
+  private async syncSingleChat(remoteJid: string, limit: number, forceSync: boolean = false): Promise<void> {
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_BASE = 2000; // 2 seconds base delay
+    let attempt = 0;
 
-      if (!lastMessage || !lastMessage.key) {
-        this.logger.warn(`No messages found for chat: ${remoteJid}, skipping...`);
-        return;
+    while (attempt < MAX_RETRIES) {
+      try {
+        attempt++;
+
+        // Get the last message from the chat to use as reference
+        const lastMessage = await this.getLastMessage(remoteJid);
+
+        // If no messages found and forceSync is enabled, use current timestamp
+        if (!lastMessage || !lastMessage.key) {
+          if (forceSync) {
+            this.logger.info(`Force sync enabled for ${remoteJid} - using current timestamp`);
+
+            const forcedKey: proto.IMessageKey = {
+              remoteJid: remoteJid,
+              id: 'forced-sync-' + Date.now(),
+              fromMe: true
+            };
+
+            const currentTimestamp = Math.floor(Date.now() / 1000);
+
+            const syncResult = await this.client.fetchMessageHistory(
+              limit,
+              forcedKey,
+              currentTimestamp
+            );
+
+            this.logger.info(`✅ Force sync completed for ${remoteJid}, syncId: ${syncResult || 'none'}`);
+            return;
+          }
+
+          this.logger.warn(`No messages found for chat: ${remoteJid}, skipping... (use forceSync: true to force)`);
+          return;
+        }
+
+        // Request message history synchronization from Baileys using sock.fetchMessageHistory
+        this.logger.verbose(`[Attempt ${attempt}/${MAX_RETRIES}] Requesting message history for ${remoteJid}: limit=${limit}, timestamp=${lastMessage.messageTimestamp}`);
+
+        const syncResult = await this.client.fetchMessageHistory(
+          limit,
+          lastMessage.key,
+          lastMessage.messageTimestamp
+        );
+
+        this.logger.info(`✅ Successfully requested sync for chat: ${remoteJid} (${limit} messages), syncId: ${syncResult || 'none'}`);
+        this.logger.info(`📦 Messages will arrive via messaging-history.set event and webhook (MESSAGES_SET)`);
+
+        // Success! Exit retry loop
+        break;
+
+      } catch (error) {
+        // If no messages found for this chat, skip it silently (this is expected for empty chats)
+        if (error?.message?.[0] === 'Messages not found') {
+          this.logger.verbose(`Skipping sync for chat ${remoteJid}: no messages found in database`);
+          return;
+        }
+
+        const errorMessage = error?.message || error?.toString() || JSON.stringify(error);
+        this.logger.warn(`❌ Sync attempt ${attempt}/${MAX_RETRIES} failed for ${remoteJid}: ${errorMessage}`);
+
+        // If max retries reached, throw error
+        if (attempt >= MAX_RETRIES) {
+          this.logger.error(`❌ Max retries (${MAX_RETRIES}) reached for ${remoteJid}, giving up`);
+          throw error;
+        }
+
+        // Exponential backoff: 2s, 4s, 8s
+        const delay = RETRY_DELAY_BASE * Math.pow(2, attempt - 1);
+        this.logger.verbose(`⏳ Waiting ${delay}ms before retry ${attempt + 1}/${MAX_RETRIES}...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
       }
-
-      // Request message history synchronization from Baileys
-      this.logger.verbose(`Requesting message history for ${remoteJid}: limit=${limit}, timestamp=${lastMessage.messageTimestamp}`);
-
-      const syncResult = await this.client.fetchMessageHistory(
-        limit,
-        lastMessage.key,
-        lastMessage.messageTimestamp
-      );
-
-      this.logger.info(`Successfully requested sync for chat: ${remoteJid} (${limit} messages), syncId: ${syncResult || 'none'}`);
-
-      // FALLBACK: Also fetch messages from database and send to webhook
-      // This ensures messages are sent even if Baileys doesn't emit the messaging-history.set event
-      await this.syncMessagesFromDatabase(remoteJid, limit);
-
-    } catch (error) {
-      // If no messages found for this chat, skip it silently (this is expected for empty chats)
-      if (error?.message?.[0] === 'Messages not found') {
-        this.logger.verbose(`Skipping sync for chat ${remoteJid}: no messages found in database`);
-        return;
-      }
-
-      const errorMessage = error?.message || error?.toString() || JSON.stringify(error);
-      this.logger.error(`Error syncing chat ${remoteJid}: ${errorMessage}`);
     }
   }
 
-  private async syncMessagesFromDatabase(remoteJid: string, limit: number): Promise<void> {
-    try {
-      this.logger.verbose(`Fetching up to ${limit} messages from database for ${remoteJid}`);
+  /**
+   * Sync multiple chats in batch using ONLY sock.fetchMessageHistory
+   */
+  private async syncMultipleChats(remoteJids: string[], limit: number, forceSync: boolean = false): Promise<void> {
+    this.logger.info(`📦 Starting batch sync for ${remoteJids.length} chats using sock.fetchMessageHistory`);
 
-      // Fetch messages from database
-      const messages = await this.prismaRepository.message.findMany({
-        where: {
-          instanceId: this.instanceId,
-          key: { path: ['remoteJid'], equals: remoteJid },
-        },
-        orderBy: { messageTimestamp: 'desc' },
-        take: limit,
-      });
+    let successCount = 0;
+    let errorCount = 0;
 
-      if (messages.length === 0) {
-        this.logger.verbose(`No messages found in database for ${remoteJid}`);
-        return;
+    for (const remoteJid of remoteJids) {
+      try {
+        await this.syncSingleChat(remoteJid, limit, forceSync);
+        successCount++;
+
+        // Small delay between chats to avoid rate limiting
+        await new Promise(resolve => setTimeout(resolve, 500));
+      } catch (error) {
+        errorCount++;
+        this.logger.error(`Failed to sync ${remoteJid}: ${error.message}`);
       }
-
-      this.logger.info(`Found ${messages.length} messages in database for ${remoteJid}, sending to webhook`);
-
-      // Send to webhook as MESSAGES_SET event
-      // Sort by timestamp ascending (oldest first) to match the order of messaging-history.set
-      const messagesAscending = messages.reverse();
-      this.sendDataWebhook(Events.MESSAGES_SET, messagesAscending);
-
-      this.logger.verbose(`Successfully sent ${messages.length} messages to webhook for ${remoteJid}`);
-    } catch (error) {
-      this.logger.error(`Error syncing messages from database for ${remoteJid}: ${error.toString()}`);
     }
+
+    this.logger.info(`✅ Batch sync completed: ${successCount} successful, ${errorCount} failed out of ${remoteJids.length} total`);
+    this.logger.info(`📦 All messages will arrive via messaging-history.set event and webhook (MESSAGES_SET)`);
   }
 
+  /**
+   * Sync MAXIMUM possible chats using ONLY sock.fetchMessageHistory
+   * Gets ALL chats from database without limit and syncs them all
+   */
   private async syncRecentChats(limit: number): Promise<void> {
     try {
-      // Get all chats, ordered by most recent first
-      const recentChats = await this.prismaRepository.chat.findMany({
+      this.logger.info('📦 Starting MAXIMUM sync using ONLY sock.fetchMessageHistory (NO LIMITS)');
+
+      // Get ALL chats from database - NO LIMIT!
+      const allChats = await this.prismaRepository.chat.findMany({
         where: {
           instanceId: this.instanceId,
         },
@@ -5602,21 +5701,26 @@ export class BaileysStartupService extends ChannelStartupService {
         orderBy: {
           updatedAt: 'desc', // Most recent chats first
         },
+        // NO take/skip - get EVERYTHING!
       });
 
-      if (!recentChats || recentChats.length === 0) {
+      if (!allChats || allChats.length === 0) {
         this.logger.warn('No chats found for this instance');
         return;
       }
 
+      this.logger.info(`📊 Found ${allChats.length} total chats in database`);
+
       // Filter only individual chats (@s.whatsapp.net), ignore groups
       const individualChats = [];
-      for (const chat of recentChats) {
+      for (const chat of allChats) {
         const validRemoteJid = await this.getValidRemoteJid(chat);
         if (validRemoteJid && validRemoteJid.includes('@s.whatsapp.net')) {
           individualChats.push({ ...chat, validRemoteJid });
         }
       }
+
+      const groupCount = allChats.length - individualChats.length;
 
       if (individualChats.length === 0) {
         this.logger.warn('No individual chats found');
@@ -5624,25 +5728,50 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       this.logger.info(
-        `Starting background synchronization for ${individualChats.length} individual chats (ignoring ${recentChats.length - individualChats.length} groups)`
+        `🚀 MAXIMUM SYNC: Processing ${individualChats.length} individual chats using sock.fetchMessageHistory (ignoring ${groupCount} groups)`
       );
+      this.logger.info(`⏱️ Estimated time: ~${Math.ceil(individualChats.length * 0.5 / 60)} minutes (500ms delay per chat)`);
 
-      // Process each chat
-      for (const chat of individualChats) {
+      let successCount = 0;
+      let errorCount = 0;
+      const startTime = Date.now();
+
+      // Process EACH chat using ONLY Baileys fetchMessageHistory
+      for (let i = 0; i < individualChats.length; i++) {
+        const chat = individualChats[i];
+        const progress = ((i + 1) / individualChats.length * 100).toFixed(1);
+
         if (!chat.validRemoteJid) {
           this.logger.warn(`Invalid remoteJid for chat: ${chat.remoteJid}, skipping...`);
+          errorCount++;
           continue;
         }
 
-        await this.syncSingleChat(chat.validRemoteJid, limit);
+        try {
+          // Uses sock.fetchMessageHistory internally
+          await this.syncSingleChat(chat.validRemoteJid, limit);
+          successCount++;
 
-        // Add a small delay between requests to avoid overwhelming the server
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+          // Log progress every 10 chats
+          if ((i + 1) % 10 === 0 || i === individualChats.length - 1) {
+            this.logger.info(`📊 Progress: ${i + 1}/${individualChats.length} chats (${progress}%) - ${successCount} ✅ / ${errorCount} ❌`);
+          }
+
+          // Reduced delay for faster processing (500ms instead of 1s)
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        } catch (error) {
+          errorCount++;
+          this.logger.error(`Failed to sync ${chat.validRemoteJid}: ${error.message}`);
+        }
       }
 
-      this.logger.info(`Background synchronization completed for ${individualChats.length} chats`);
+      const totalTime = ((Date.now() - startTime) / 1000 / 60).toFixed(1);
+
+      this.logger.info(`✅ MAXIMUM SYNC COMPLETED in ${totalTime} minutes!`);
+      this.logger.info(`📊 Results: ${successCount} successful ✅ / ${errorCount} failed ❌ out of ${individualChats.length} total`);
+      this.logger.info(`📦 All messages will arrive via messaging-history.set event and webhook (MESSAGES_SET)`);
     } catch (error) {
-      this.logger.error(`Error in background sync: ${error.toString()}`);
+      this.logger.error(`Error in maximum sync: ${error.toString()}`);
     }
   }
 
@@ -6575,7 +6704,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async baileysGenerateMessageTag() {
-    const response = await this.client.generateMessageTag();
+    const response = this.client.generateMessageTag();
 
     return response;
   }
@@ -6681,7 +6810,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   //Business Controller
-  public async fetchCatalog(instanceName: string, data: getCollectionsDto) {
+  public async fetchCatalog(_instanceName: string, data: getCollectionsDto) {
     const jid = data.number ? createJid(data.number) : this.client?.user?.id;
     const limit = data.limit || 10;
     const cursor = null;
@@ -6751,7 +6880,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  public async fetchCollections(instanceName: string, data: getCollectionsDto) {
+  public async fetchCollections(_instanceName: string, data: getCollectionsDto) {
     const jid = data.number ? createJid(data.number) : this.client?.user?.id;
     const limit = data.limit <= 20 ? data.limit : 20; //(tem esse limite, não sei porque)
 

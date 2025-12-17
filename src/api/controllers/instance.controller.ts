@@ -327,6 +327,7 @@ export class InstanceController {
             instanceName: instanceName,
             status: 'open',
           },
+          connectionStatus: 'open',
           message: 'Instance is already connected',
           connected: true,
           alreadyConnected: true,
@@ -350,6 +351,7 @@ export class InstanceController {
             expiresIn: expiresIn, // milliseconds until expiry (0 if expired)
             isExpired: expiresIn !== null && expiresIn <= 0,
             connected: false, // Still connecting
+            connectionStatus: 'connecting',
           };
         }
 
@@ -374,6 +376,7 @@ export class InstanceController {
               expiresIn: expiresIn,
               isExpired: false, // Just generated, definitely not expired
               connected: false, // Still connecting
+              connectionStatus: 'connecting',
             };
           }
           await delay(500);
@@ -390,6 +393,7 @@ export class InstanceController {
             instanceName: instanceName,
             status: state,
           },
+          connectionStatus: state,
         };
       }
 
@@ -418,6 +422,7 @@ export class InstanceController {
               expiresIn: expiresIn,
               isExpired: false,
               connected: false,
+              connectionStatus: 'connecting',
             };
           }
           await delay(500);
@@ -434,6 +439,7 @@ export class InstanceController {
             instanceName: instanceName,
             status: instance.connectionStatus?.state || 'unknown',
           },
+          connectionStatus: instance.connectionStatus?.state || 'close',
         };
       }
 
@@ -444,6 +450,7 @@ export class InstanceController {
         },
         connected: state === 'open',
         qrcode: instance?.qrCode,
+        connectionStatus: state,
       };
     } catch (error) {
       this.logger.error(error);

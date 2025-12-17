@@ -129,6 +129,30 @@ export class BlockUserDto {
 }
 
 export class SyncMessagesDto {
+  /**
+   * Optional: Specific chat to sync (phone number or JID)
+   * If not provided, syncs all recent individual chats
+   * @example "5511999999999" or "5511999999999@s.whatsapp.net"
+   */
   remoteJid?: string;
+
+  /**
+   * Number of messages to sync per chat (default: 100, max: 500)
+   * @example 100
+   */
   limit?: number;
+
+  /**
+   * Optional: Array of multiple chats to sync
+   * Alternative to remoteJid for batch sync
+   * @example ["5511999999999", "5511888888888"]
+   */
+  remoteJids?: string[];
+
+  /**
+   * Force full sync even if no previous messages exist
+   * Uses current timestamp as reference (default: false)
+   * @example false
+   */
+  forceSync?: boolean;
 }

@@ -191,6 +191,13 @@ export const syncMessagesSchema: JSONSchema7 = {
   properties: {
     remoteJid: { type: 'string' },
     limit: { type: 'integer', minimum: 1, maximum: 500 },
+    remoteJids: {
+      type: 'array',
+      items: { type: 'string' },
+      minItems: 1,
+      maxItems: 50, // Max 50 chats at once
+    },
+    forceSync: { type: 'boolean' },
   },
 };
 
