@@ -36,6 +36,22 @@ export class InstanceController {
 
   public async createInstance(instanceData: InstanceDto) {
     try {
+      // Test proxy BEFORE creating instance
+      if (instanceData.proxyHost && instanceData.proxyPort && instanceData.proxyProtocol) {
+        this.logger.verbose('Testing proxy configuration before creating instance...');
+        const testProxy = await this.proxyService.testProxy({
+          host: instanceData.proxyHost,
+          port: instanceData.proxyPort,
+          protocol: instanceData.proxyProtocol,
+          username: instanceData.proxyUsername,
+          password: instanceData.proxyPassword,
+        });
+        if (!testProxy) {
+          throw new BadRequestException('Invalid proxy configuration. Please verify your proxy settings.');
+        }
+        this.logger.verbose('Proxy configuration validated successfully');
+      }
+
       const instance = channelController.init(instanceData, {
         configService: this.configService,
         eventEmitter: this.eventEmitter,
@@ -92,18 +108,8 @@ export class InstanceController {
         instanceId: instanceId,
       });
 
+      // Configure proxy (already validated above)
       if (instanceData.proxyHost && instanceData.proxyPort && instanceData.proxyProtocol) {
-        const testProxy = await this.proxyService.testProxy({
-          host: instanceData.proxyHost,
-          port: instanceData.proxyPort,
-          protocol: instanceData.proxyProtocol,
-          username: instanceData.proxyUsername,
-          password: instanceData.proxyPassword,
-        });
-        if (!testProxy) {
-          throw new BadRequestException('Invalid proxy');
-        }
-
         await this.proxyService.createProxy(instance, {
           enabled: true,
           host: instanceData.proxyHost,
@@ -318,6 +324,32 @@ export class InstanceController {
 
       if (!state) {
         throw new BadRequestException('The "' + instanceName + '" instance does not exist');
+      }
+
+      // Test proxy before connecting if proxy is configured
+      try {
+        const proxyConfig = await this.proxyService.findProxy({ instanceName });
+        if (proxyConfig && proxyConfig.enabled) {
+          this.logger.verbose(`Testing proxy configuration before connecting instance ${instanceName}...`);
+          const testProxy = await this.proxyService.testProxy({
+            host: proxyConfig.host,
+            port: proxyConfig.port,
+            protocol: proxyConfig.protocol,
+            username: proxyConfig.username,
+            password: proxyConfig.password,
+          });
+          if (!testProxy) {
+            throw new BadRequestException('Invalid proxy configuration. Please verify your proxy settings before connecting.');
+          }
+          this.logger.verbose('Proxy configuration validated successfully');
+        }
+      } catch (error) {
+        // If proxy validation fails, throw the error
+        if (error instanceof BadRequestException) {
+          throw error;
+        }
+        // If proxy doesn't exist or other errors, continue (proxy is optional)
+        this.logger.verbose('No proxy configured or error checking proxy, continuing connection...');
       }
 
       if (state == 'open') {
