@@ -361,6 +361,11 @@ export class BaileysStartupService extends ChannelStartupService {
     qrCodeGeneratedCount: 0,
   };
 
+  // Proxy fallback tracking: if connection fails without generating QR code, disable proxy
+  private proxyConnectionFailures = 0;
+  private readonly MAX_PROXY_FAILURES_BEFORE_DISABLE = 2;
+  private proxyDisabledDueToFailure = false;
+
   public stateConnection: wa.StateConnection = { state: 'close' };
 
   public phoneNumber: string;
@@ -614,7 +619,7 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
-  public async logoutInstance() {
+  public async logoutInstance(reconnect = true) {
     this.logger.info(`🔄 Starting fresh logout and reconnect for instance: ${this.instanceName}`);
 
     try {
@@ -625,7 +630,39 @@ export class BaileysStartupService extends ChannelStartupService {
 
       // Step 2: Logout from WhatsApp
       this.logger.verbose('Step 2: Logging out from WhatsApp');
-      await this.client?.logout('Fresh restart - clearing all sessions: ' + this.instanceName);
+      try {
+        if (this.client) {
+          await this.client.logout('Fresh restart - clearing all sessions: ' + this.instanceName);
+        }
+      } catch (logoutError) {
+        this.logger.warn(`WhatsApp logout failed (expected if connection is already closed): ${logoutError.message}`);
+        // Only throw if it's NOT a connection closed error and NOT a "not opened" error
+        if (!logoutError.message?.toLowerCase().includes('closed') &&
+          !logoutError.message?.toLowerCase().includes('not opened') &&
+          !logoutError.message?.toLowerCase().includes('connection')) {
+          // Keep the process going anyway, just log it
+          this.logger.error(`Unexpected logout error: ${logoutError.message}`);
+        }
+      }
+
+      // PROXY FALLBACK: If we're logging out and no QR was ever generated, disable proxy permanently in DB
+      if (this.localProxy?.enabled && this.instance.qrcode?.count === 0) {
+        this.logger.warn(`⚠️ Connection was stuck without QR code. Disabling proxy permanently for instance: ${this.instanceName}`);
+        try {
+          // Disable in DB via ChannelStartupService.setProxy
+          await this.setProxy({
+            enabled: false,
+            host: this.localProxy.host,
+            port: this.localProxy.port,
+            protocol: this.localProxy.protocol,
+            username: this.localProxy.username,
+            password: this.localProxy.password
+          });
+          this.proxyDisabledDueToFailure = true;
+        } catch (dbError) {
+          this.logger.error(`Failed to disable proxy in database: ${dbError.message}`);
+        }
+      }
 
       // Step 3: Close WebSocket connection
       this.logger.verbose('Step 3: Closing WebSocket connection');
@@ -709,16 +746,23 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.verbose('Step 8: Waiting for cleanup to complete...');
       await new Promise(resolve => setTimeout(resolve, 2000));
 
-      // Step 9: Reconnect as fresh instance (will generate new QR code)
-      this.logger.info('🔄 Step 9: Reconnecting as fresh instance...');
-      await this.connectToWhatsapp();
-
-      this.logger.info('✅ Logout and fresh reconnect completed successfully!');
-      this.logger.info('📱 New QR code should be generated for pairing');
+      // Step 9: Reconnect as fresh instance (will generate new QR code) - ONLY if requested
+      if (reconnect) {
+        this.logger.info('🔄 Step 9: Reconnecting as fresh instance...');
+        await this.connectToWhatsapp();
+        this.logger.info('✅ Logout and fresh reconnect completed successfully!');
+        this.logger.info('📱 New QR code should be generated for pairing');
+      } else {
+        this.logger.info('✅ Logout completed successfully (no reconnection requested)');
+      }
 
     } catch (error) {
-      this.logger.error(`❌ Error during logout and reconnect: ${error.message}`);
-      throw error;
+      const errorMessage = error?.message || (typeof error === 'string' ? error : JSON.stringify(error));
+      this.logger.error(`❌ Error during logoutInstance: ${errorMessage}`);
+      // Don't rethrow for "Connection Closed" as we've already done our best to clean up
+      if (!errorMessage.toLowerCase().includes('closed') && !errorMessage.toLowerCase().includes('connection')) {
+        throw error;
+      }
     }
   }
 
@@ -1196,6 +1240,46 @@ export class BaileysStartupService extends ChannelStartupService {
 
       this.logger.info(`Connection closed (statusCode: ${statusCode}, shouldReconnect: ${shouldReconnect})`);
 
+      // PROXY FALLBACK: If proxy is enabled and no QR code was generated, track failure
+      if (this.localProxy?.enabled && !this.proxyDisabledDueToFailure && shouldReconnect) {
+        const qrWasGenerated = this.instance.qrcode?.count > 0;
+        if (!qrWasGenerated) {
+          this.proxyConnectionFailures++;
+          this.logger.warn(`Proxy connection failed without QR code (attempt ${this.proxyConnectionFailures}/${this.MAX_PROXY_FAILURES_BEFORE_DISABLE})`);
+
+          if (this.proxyConnectionFailures >= this.MAX_PROXY_FAILURES_BEFORE_DISABLE) {
+            this.logger.warn('⚠️ Disabling proxy due to repeated connection failures without QR code generation');
+            this.logger.warn(`Proxy was: ${this.localProxy.host}:${this.localProxy.port}`);
+
+            // Disable in DB via ChannelStartupService.setProxy to make it persistent
+            try {
+              await this.setProxy({
+                enabled: false,
+                host: this.localProxy.host,
+                port: this.localProxy.port,
+                protocol: this.localProxy.protocol,
+                username: this.localProxy.username,
+                password: this.localProxy.password
+              });
+              this.proxyDisabledDueToFailure = true;
+            } catch (dbError) {
+              this.logger.error(`Failed to disable proxy in database: ${dbError.message}`);
+              // Fallback to memory-only disable if DB fails
+              this.localProxy.enabled = false;
+            }
+
+            this.proxyConnectionFailures = 0;
+
+            // Send webhook about proxy being disabled
+            this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+              instance: this.instance.name,
+              state: 'connecting',
+              message: 'Proxy disabled due to connection failures, attempting direct connection',
+            });
+          }
+        }
+      }
+
       // Update connection status (WITH await to prevent race conditions)
       await this.updateConnectionStatus('close', {
         disconnectionAt: new Date(),
@@ -1275,6 +1359,12 @@ export class BaileysStartupService extends ChannelStartupService {
       this.instance.qrcode.pairingCode = null;
       this.endSession = false;
       this.reconnectAttempts = 0;
+
+      // Reset proxy failure tracking on successful connection
+      this.proxyConnectionFailures = 0;
+      if (this.proxyDisabledDueToFailure) {
+        this.logger.info('Connection succeeded without proxy - proxy remains disabled for this session');
+      }
 
       // Update connection status (WITH await to prevent race conditions)
       const profileName = await this.getProfileName();
@@ -1790,9 +1880,9 @@ export class BaileysStartupService extends ChannelStartupService {
         const contactsRaw: any = contacts.map((contact) => {
           // v7: Extrair phone number do contact.phoneNumber ou contact.id
           const phoneNumber = contact.phoneNumber ||
-                             (contact.id?.includes('@s.whatsapp.net')
-                               ? contact.id.split('@')[0]
-                               : null);
+            (contact.id?.includes('@s.whatsapp.net')
+              ? contact.id.split('@')[0]
+              : null);
 
           return {
             remoteJid: contact.id,
@@ -1991,16 +2081,16 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const messagesRepository: Set<string> = new Set(
           chatwootImport.getRepositoryMessagesCache(instance) ??
-            (
-              await this.prismaRepository.message.findMany({
-                select: { key: true },
-                where: { instanceId: this.instanceId },
-              })
-            ).map((message) => {
-              const key = message.key as { id: string };
+          (
+            await this.prismaRepository.message.findMany({
+              select: { key: true },
+              where: { instanceId: this.instanceId },
+            })
+          ).map((message) => {
+            const key = message.key as { id: string };
 
-              return key.id;
-            }),
+            return key.id;
+          }),
         );
 
         if (chatwootImport.getRepositoryMessagesCache(instance) === null) {
@@ -2550,9 +2640,9 @@ export class BaileysStartupService extends ChannelStartupService {
         // Log detalhado para debugging de perda de mensagens
         this.logger.error(
           `[messages.upsert] CRITICAL ERROR - Message processing failed: ${error.message}\n` +
-            `Stack: ${error.stack}\n` +
-            `InstanceId: ${this.instanceId}\n` +
-            `Timestamp: ${new Date().toISOString()}`,
+          `Stack: ${error.stack}\n` +
+          `InstanceId: ${this.instanceId}\n` +
+          `Timestamp: ${new Date().toISOString()}`,
         );
 
         // FAILSAFE: Tentar enviar evento com dados originais mesmo que tenha dado erro
@@ -2739,7 +2829,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
               if (message.messageId) {
-                await this.prismaRepository.messageUpdate.create({ 
+                await this.prismaRepository.messageUpdate.create({
                   data: {
                     ...message,
                     messageId: message.messageId
@@ -2794,7 +2884,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
             if (message.messageId) {
-              await this.prismaRepository.messageUpdate.create({ 
+              await this.prismaRepository.messageUpdate.create({
                 data: {
                   ...message,
                   messageId: message.messageId
@@ -2952,147 +3042,147 @@ export class BaileysStartupService extends ChannelStartupService {
               // Use background-refreshed cache - NEVER await here to avoid blocking
               const settings = this.settingsCache;
 
-        if (events.call) {
-          const call = events.call[0];
+              if (events.call) {
+                const call = events.call[0];
 
-          if (settings?.rejectCall && call.status == 'offer') {
-            this.client.rejectCall(call.id, call.from);
-          }
+                if (settings?.rejectCall && call.status == 'offer') {
+                  this.client.rejectCall(call.id, call.from);
+                }
 
-          if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
-            const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+                if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
+                  const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
 
-            this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
-          }
+                  this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+                }
 
-          this.sendDataWebhook(Events.CALL, call);
-        }
+                this.sendDataWebhook(Events.CALL, call);
+              }
 
-        if (events['connection.update']) {
-          this.connectionUpdate(events['connection.update']);
-        }
+              if (events['connection.update']) {
+                this.connectionUpdate(events['connection.update']);
+              }
 
-        if (events['creds.update']) {
-          this.instance.authState.saveCreds();
-        }
+              if (events['creds.update']) {
+                this.instance.authState.saveCreds();
+              }
 
-        if (events['messaging-history.set']) {
-          const payload = events['messaging-history.set'];
-          this.logger.log(`📦 messaging-history.set event received: ${payload.messages?.length || 0} messages, ${payload.chats?.length || 0} chats, syncType: ${payload.syncType}, progress: ${payload.progress}%`);
+              if (events['messaging-history.set']) {
+                const payload = events['messaging-history.set'];
+                this.logger.log(`📦 messaging-history.set event received: ${payload.messages?.length || 0} messages, ${payload.chats?.length || 0} chats, syncType: ${payload.syncType}, progress: ${payload.progress}%`);
 
-          // CRITICAL: Process in background to NEVER block realtime events
-          // Using setImmediate ensures this runs AFTER current event loop iteration
-          setImmediate(() => {
-            this.messageHandle['messaging-history.set'](payload).catch((error) => {
-              this.logger.error('❌ Error processing messaging-history.set:');
-              this.logger.error(error);
-            });
-          });
-        }
+                // CRITICAL: Process in background to NEVER block realtime events
+                // Using setImmediate ensures this runs AFTER current event loop iteration
+                setImmediate(() => {
+                  this.messageHandle['messaging-history.set'](payload).catch((error) => {
+                    this.logger.error('❌ Error processing messaging-history.set:');
+                    this.logger.error(error);
+                  });
+                });
+              }
 
-        if (events['messages.upsert']) {
-          const payload = events['messages.upsert'];
+              if (events['messages.upsert']) {
+                const payload = events['messages.upsert'];
 
-          // DIAGNOSTIC: Log to confirm event is being received from Baileys
-          this.logger.log(`messages.upsert event received: ${payload.messages.length} messages, type: ${payload.type}`);
+                // DIAGNOSTIC: Log to confirm event is being received from Baileys
+                this.logger.log(`messages.upsert event received: ${payload.messages.length} messages, type: ${payload.type}`);
 
-          this.messageProcessor.processMessage(payload, settings);
-          // this.messageHandle['messages.upsert'](payload, settings);
-        }
+                this.messageProcessor.processMessage(payload, settings);
+                // this.messageHandle['messages.upsert'](payload, settings);
+              }
 
-        if (events['messages.update']) {
-          const payload = events['messages.update'];
-          this.messageHandle['messages.update'](payload, settings);
-        }
+              if (events['messages.update']) {
+                const payload = events['messages.update'];
+                this.messageHandle['messages.update'](payload, settings);
+              }
 
-        if (events['message-receipt.update']) {
-          const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
-          const remotesJidMap: Record<string, number> = {};
+              if (events['message-receipt.update']) {
+                const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
+                const remotesJidMap: Record<string, number> = {};
 
-          for (const event of payload) {
-            if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
-              remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+                for (const event of payload) {
+                  if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
+                    remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
+                  }
+                }
+
+                await Promise.all(
+                  Object.keys(remotesJidMap).map(async (remoteJid) =>
+                    this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
+                  ),
+                );
+              }
+
+              if (events['presence.update']) {
+                const payload = events['presence.update'];
+
+                if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
+                  return;
+                }
+
+                this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
+              }
+
+              if (!settings?.groupsIgnore) {
+                if (events['groups.upsert']) {
+                  const payload = events['groups.upsert'];
+                  this.groupHandler['groups.upsert'](payload);
+                }
+
+                if (events['groups.update']) {
+                  const payload = events['groups.update'];
+                  this.groupHandler['groups.update'](payload);
+                }
+
+                if (events['group-participants.update']) {
+                  const payload = events['group-participants.update'];
+                  // Map GroupParticipant[] to string[] for compatibility
+                  const mappedPayload = {
+                    ...payload,
+                    participants: payload.participants.map((p: GroupParticipant | string) =>
+                      typeof p === 'string' ? p : p.id
+                    ),
+                  };
+                  this.groupHandler['group-participants.update'](mappedPayload);
+                }
+              }
+
+              if (events['chats.upsert']) {
+                const payload = events['chats.upsert'];
+                this.chatHandle['chats.upsert'](payload);
+              }
+
+              if (events['chats.update']) {
+                const payload = events['chats.update'];
+                this.chatHandle['chats.update'](payload);
+              }
+
+              if (events['chats.delete']) {
+                const payload = events['chats.delete'];
+                this.chatHandle['chats.delete'](payload);
+              }
+
+              if (events['contacts.upsert']) {
+                const payload = events['contacts.upsert'];
+                this.contactHandle['contacts.upsert'](payload);
+              }
+
+              if (events['contacts.update']) {
+                const payload = events['contacts.update'];
+                this.contactHandle['contacts.update'](payload);
+              }
+
+              if (events[Events.LABELS_ASSOCIATION]) {
+                const payload = events[Events.LABELS_ASSOCIATION];
+                this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
+                return;
+              }
+
+              if (events[Events.LABELS_EDIT]) {
+                const payload = events[Events.LABELS_EDIT];
+                this.labelHandle[Events.LABELS_EDIT](payload);
+                return;
+              }
             }
-          }
-
-          await Promise.all(
-            Object.keys(remotesJidMap).map(async (remoteJid) =>
-              this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
-            ),
-          );
-        }
-
-        if (events['presence.update']) {
-          const payload = events['presence.update'];
-
-          if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
-            return;
-          }
-
-          this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
-        }
-
-        if (!settings?.groupsIgnore) {
-          if (events['groups.upsert']) {
-            const payload = events['groups.upsert'];
-            this.groupHandler['groups.upsert'](payload);
-          }
-
-          if (events['groups.update']) {
-            const payload = events['groups.update'];
-            this.groupHandler['groups.update'](payload);
-          }
-
-          if (events['group-participants.update']) {
-            const payload = events['group-participants.update'];
-            // Map GroupParticipant[] to string[] for compatibility
-            const mappedPayload = {
-              ...payload,
-              participants: payload.participants.map((p: GroupParticipant | string) =>
-                typeof p === 'string' ? p : p.id
-              ),
-            };
-            this.groupHandler['group-participants.update'](mappedPayload);
-          }
-        }
-
-        if (events['chats.upsert']) {
-          const payload = events['chats.upsert'];
-          this.chatHandle['chats.upsert'](payload);
-        }
-
-        if (events['chats.update']) {
-          const payload = events['chats.update'];
-          this.chatHandle['chats.update'](payload);
-        }
-
-        if (events['chats.delete']) {
-          const payload = events['chats.delete'];
-          this.chatHandle['chats.delete'](payload);
-        }
-
-        if (events['contacts.upsert']) {
-          const payload = events['contacts.upsert'];
-          this.contactHandle['contacts.upsert'](payload);
-        }
-
-        if (events['contacts.update']) {
-          const payload = events['contacts.update'];
-          this.contactHandle['contacts.update'](payload);
-        }
-
-        if (events[Events.LABELS_ASSOCIATION]) {
-          const payload = events[Events.LABELS_ASSOCIATION];
-          this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
-          return;
-        }
-
-        if (events[Events.LABELS_EDIT]) {
-          const payload = events[Events.LABELS_EDIT];
-          this.labelHandle[Events.LABELS_EDIT](payload);
-          return;
-        }
-        }
           })(), // End of async function for Promise.race
           timeoutPromise
         ]);
@@ -6947,11 +7037,11 @@ export class BaileysStartupService extends ChannelStartupService {
     const remoteJidFilter =
       keyFilters?.remoteJid && typeof keyFilters.remoteJid === 'string' && keyFilters.remoteJid.trim().length > 0
         ? {
-            OR: [
-              { key: { path: ['remoteJid'], equals: keyFilters.remoteJid } },
-              { key: { path: ['remoteJidAlt'], equals: keyFilters.remoteJid } },
-            ],
-          }
+          OR: [
+            { key: { path: ['remoteJid'], equals: keyFilters.remoteJid } },
+            { key: { path: ['remoteJidAlt'], equals: keyFilters.remoteJid } },
+          ],
+        }
         : {};
 
     const count = await this.prismaRepository.message.count({

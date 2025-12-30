@@ -30,7 +30,7 @@ export class InstanceController {
     private readonly chatwootCache: CacheService,
     private readonly baileysCache: CacheService,
     private readonly providerFiles: ProviderFiles,
-  ) {}
+  ) { }
 
   private readonly logger = new Logger('InstanceController');
 
@@ -607,7 +607,8 @@ export class InstanceController {
 
       return { status: 'SUCCESS', error: false, response: { message: 'Instance logged out' } };
     } catch (error) {
-      throw new InternalServerErrorException(error.toString());
+      const errorMessage = error?.message || (typeof error === 'string' ? error : JSON.stringify(error));
+      throw new InternalServerErrorException(errorMessage);
     }
   }
 
@@ -618,7 +619,8 @@ export class InstanceController {
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) waInstances?.clearCacheChatwoot();
 
       if (instance.state === 'connecting' || instance.state === 'open') {
-        await this.logout({ instanceName });
+        // Pass reconnect: false to avoid restarting during deletion
+        await this.waMonitor.waInstances[instanceName]?.logoutInstance(false);
       }
 
       try {
@@ -633,7 +635,8 @@ export class InstanceController {
       this.eventEmitter.emit('remove.instance', instanceName, 'inner');
       return { status: 'SUCCESS', error: false, response: { message: 'Instance deleted' } };
     } catch (error) {
-      throw new BadRequestException(error.toString());
+      const errorMessage = error?.message || (typeof error === 'string' ? error : JSON.stringify(error));
+      throw new BadRequestException(errorMessage);
     }
   }
 }

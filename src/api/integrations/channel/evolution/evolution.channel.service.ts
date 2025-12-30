@@ -61,7 +61,7 @@ export class EvolutionStartupService extends ChannelStartupService {
     };
   }
 
-  public async logoutInstance() {
+  public async logoutInstance(reconnect = true) {
     await this.closeClient();
   }
 
