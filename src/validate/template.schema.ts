@@ -34,3 +34,26 @@ export const templateSchema: JSONSchema7 = {
   required: ['name', 'category', 'language', 'components'],
   ...isNotEmpty('name', 'category', 'language', 'components'),
 };
+
+export const updateTemplateSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    templateId: { type: 'string' },
+    category: { type: 'string', enum: ['AUTHENTICATION', 'MARKETING', 'UTILITY'] },
+    components: { type: 'array' },
+  },
+  required: ['templateId'],
+  ...isNotEmpty('templateId'),
+};
+
+export const deleteTemplateSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    templateId: { type: 'string' },
+    name: { type: 'string' },
+  },
+  required: ['templateId', 'name'],
+  ...isNotEmpty('templateId', 'name'),
+};

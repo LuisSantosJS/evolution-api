@@ -31,11 +31,17 @@ export class WebsocketController extends EventController implements EventControl
           const params = new URLSearchParams(url.search);
 
           const { remoteAddress } = req.socket;
-          const isLocalhost =
-            remoteAddress === '127.0.0.1' || remoteAddress === '::1' || remoteAddress === '::ffff:127.0.0.1';
+          const websocketConfig = configService.get<Websocket>('WEBSOCKET');
+          const allowedHosts = websocketConfig.ALLOWED_HOSTS || '127.0.0.1,::1,::ffff:127.0.0.1';
+          const allowAllHosts = allowedHosts.trim() === '*';
+          const isAllowedHost =
+            allowAllHosts ||
+            allowedHosts
+              .split(',')
+              .map((h) => h.trim())
+              .includes(remoteAddress);
 
-          // Permite conexões internas do Socket.IO (EIO=4 é o Engine.IO v4)
-          if (params.has('EIO') && isLocalhost) {
+          if (params.has('EIO') && isAllowedHost) {
             return callback(null, true);
           }
 
@@ -112,6 +118,7 @@ export class WebsocketController extends EventController implements EventControl
     sender,
     apiKey,
     integration,
+    extra,
   }: EmitData): Promise<void> {
     if (integration && !integration.includes('websocket')) {
       return;
@@ -124,6 +131,7 @@ export class WebsocketController extends EventController implements EventControl
     const configEv = event.replace(/[.-]/gm, '_').toUpperCase();
     const logEnabled = configService.get<Log>('LOG').LEVEL.includes('WEBSOCKET');
     const message = {
+      ...(extra ?? {}),
       event,
       instance: instanceName,
       data,

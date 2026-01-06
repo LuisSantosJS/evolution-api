@@ -56,6 +56,16 @@ export class N8nService extends BaseChatbotService<N8n, N8nSetting> {
         apiKey: instance.token,
       };
 
+      // Handle quoted messages
+      const contextInfo = msg?.message?.extendedTextMessage?.contextInfo || msg?.contextInfo;
+      if (contextInfo?.stanzaId) {
+        payload.quotedMessage = {
+          stanzaId: contextInfo.stanzaId,
+          participant: contextInfo.participant,
+          quotedMessage: contextInfo.quotedMessage,
+        };
+      }
+
       // Handle audio messages
       if (this.isAudioMessage(content) && msg) {
         try {

@@ -14,7 +14,7 @@ export class OnWhatsAppDto {
     public readonly number: string,
     public readonly name?: string,
     public readonly lid?: string,
-  ) {}
+  ) { }
 }
 
 export class getBase64FromMediaMessageDto {
@@ -131,7 +131,7 @@ export class BlockUserDto {
 export class SyncMessagesDto {
   /**
    * Optional: Specific chat to sync (phone number or JID)
-   * If not provided, syncs all recent individual chats
+   * If not provided, syncs all recent chats based on 'source' option
    * @example "5511999999999" or "5511999999999@s.whatsapp.net"
    */
   remoteJid?: string;
@@ -155,4 +155,34 @@ export class SyncMessagesDto {
    * @example false
    */
   forceSync?: boolean;
+
+  /**
+   * Source to get chat list from:
+   * - 'database': Syncs only chats that exist in the database (default)
+   * - 'whatsapp': Syncs chats from WhatsApp cache (recovers lost chats)
+   * - 'all': Syncs from both sources (most complete)
+   * @example "whatsapp"
+   */
+  source?: 'database' | 'whatsapp' | 'all';
+
+  /**
+   * Include group chats in sync (default: false)
+   * Only applies when syncing all chats (no remoteJid specified)
+   * @example false
+   */
+  includeGroups?: boolean;
+
+  /**
+   * Maximum number of chats to sync when syncing all (default: 100, max: 500)
+   * Only applies when no remoteJid is specified
+   * @example 100
+   */
+  maxChats?: number;
+
+  /**
+   * Force requesting full history from WhatsApp server
+   * This will trigger a new history sync request (may take time)
+   * @example false
+   */
+  requestFullSync?: boolean;
 }

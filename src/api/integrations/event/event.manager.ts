@@ -105,13 +105,14 @@ export class EventManager {
     instanceName: string;
     origin: string;
     event: string;
-    data: Object;
+    data: object;
     serverUrl: string;
     dateTime: string;
     sender: string;
     apiKey?: string;
     local?: boolean;
     integration?: string[];
+    extra?: Record<string, any>;
   }): Promise<void> {
     await this.websocket.emit(eventData);
     await this.rabbitmq.emit(eventData);

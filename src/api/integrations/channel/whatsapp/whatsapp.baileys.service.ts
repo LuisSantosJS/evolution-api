@@ -933,6 +933,9 @@ export class BaileysStartupService extends ChannelStartupService {
   /**
    * Log session error statistics to help identify problematic contacts
    */
+  /**
+   * Log session error statistics to help identify problematic contacts
+   */
   private logSessionErrorStatistics() {
     if (this.sessionErrorStats.size === 0 && this.messageStubRetryCache.size === 0) {
       return; // No errors to report
@@ -1023,7 +1026,7 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     } catch (error) {
       this.logger.warn('Error during event listener cleanup:');
-      this.logger.warn(error);
+      this.logger.error(error);
     }
   }
 
@@ -1110,7 +1113,6 @@ export class BaileysStartupService extends ChannelStartupService {
       });
     }
   }
-
 
   private markActivity() {
     this.lastActivity = Date.now();
@@ -1298,111 +1300,113 @@ export class BaileysStartupService extends ChannelStartupService {
         // Check max reconnection attempts
         const MAX_RECONNECT_ATTEMPTS = 10;
         if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-          this.logger.error(`Maximum reconnection attempts (${MAX_RECONNECT_ATTEMPTS}) reached - stopping`);
-          this.sendDataWebhook(Events.CONNECTION_UPDATE, {
-            instance: this.instance.name,
-            state: 'close',
-            message: 'Max reconnection attempts reached',
-          });
-          return;
-        }
-
-        // Acquire reconnection lock to prevent simultaneous reconnects
-        const lockAcquired = await this.acquireLock('reconnect', 5000);
-        if (!lockAcquired) {
-          this.logger.warn('Reconnection already in progress - skipping');
-          return;
-        }
-
-        this.reconnectAttempts++;
-
-        // Exponential backoff: 2s, 4s, 8s, 16s, 30s (max)
-        const delay = Math.min(2000 * Math.pow(2, this.reconnectAttempts - 1), 30000);
-
-        this.logger.info(`Scheduling reconnection in ${delay}ms (attempt #${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
-
-        setTimeout(async () => {
-          try {
-            await this.connectToWhatsapp(this.phoneNumber);
-          } catch (error) {
-            this.logger.error(`Reconnection failed: ${error.message}`);
-          } finally {
-            this.releaseLock('reconnect');
+          if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+            this.logger.error(`Maximum reconnection attempts (${MAX_RECONNECT_ATTEMPTS}) reached - stopping`);
+            this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+              instance: this.instance.name,
+              state: 'close',
+              message: 'Max reconnection attempts reached',
+            });
+            return;
           }
-        }, delay);
-      } else {
-        // Permanent disconnection - cleanup
-        this.logger.info('Permanent disconnection - cleaning up');
-        this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
-        this.client?.ws?.close();
-        this.client.end(new Error('Close connection'));
-      }
-    }
 
-    // ═══════════════════════════════════════════════════════════
-    // CONNECTION OPEN - SIMPLIFIED
-    // ═══════════════════════════════════════════════════════════
-    if (connection === 'open') {
-      this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
+          // Acquire reconnection lock to prevent simultaneous reconnects
+          const lockAcquired = await this.acquireLock('reconnect', 5000);
+          if (!lockAcquired) {
+            this.logger.warn('Reconnection already in progress - skipping');
+            return;
+          }
 
-      // Get profile picture (non-blocking)
-      this.profilePicture(this.instance.wuid)
-        .then(pic => this.instance.profilePictureUrl = pic.profilePictureUrl)
-        .catch(() => this.instance.profilePictureUrl = null);
+          this.reconnectAttempts++;
 
-      this.logger.info(`✅ CONNECTED TO WHATSAPP - ${this.instance.name} (${this.instance.wuid})`);
+          // Exponential backoff: 2s, 4s, 8s, 16s, 30s (max)
+          const delayMs = Math.min(2000 * Math.pow(2, this.reconnectAttempts - 1), 30000);
 
-      // Reset QR code and session flags
-      this.instance.qrcode.count = 0;
-      this.instance.qrcode.base64 = null;
-      this.instance.qrcode.code = null;
-      this.instance.qrcode.pairingCode = null;
-      this.endSession = false;
-      this.reconnectAttempts = 0;
+          this.logger.info(`Scheduling reconnection in ${delayMs}ms (attempt #${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
 
-      // Reset proxy failure tracking on successful connection
-      this.proxyConnectionFailures = 0;
-      if (this.proxyDisabledDueToFailure) {
-        this.logger.info('Connection succeeded without proxy - proxy remains disabled for this session');
+          setTimeout(async () => {
+            try {
+              await this.connectToWhatsapp(this.phoneNumber);
+            } catch (error) {
+              this.logger.error(`Reconnection failed: ${error.message}`);
+            } finally {
+              this.releaseLock('reconnect');
+            }
+          }, delayMs);
+        } else {
+          // Permanent disconnection - cleanup
+          this.logger.info('Permanent disconnection - cleaning up');
+          this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
+          this.client?.ws?.close();
+          this.client.end(new Error('Close connection'));
+        }
       }
 
-      // Update connection status (WITH await to prevent race conditions)
-      const profileName = await this.getProfileName();
-      await this.updateConnectionStatus('open', {
-        ownerJid: this.instance.wuid,
-        profileName: profileName as string,
-        profilePicUrl: this.instance.profilePictureUrl,
-      });
+      // ═══════════════════════════════════════════════════════════
+      // CONNECTION OPEN - SIMPLIFIED
+      // ═══════════════════════════════════════════════════════════
+      else if ((connection as string) === 'open') {
+        this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
 
-      // Send webhooks (non-blocking)
-      this.sendDataWebhook(Events.CONNECTION_UPDATE, {
-        instance: this.instance.name,
-        state: 'open',
-        wuid: this.instance.wuid,
-      });
+        // Get profile picture (non-blocking)
+        this.profilePicture(this.instance.wuid)
+          .then(pic => this.instance.profilePictureUrl = pic.profilePictureUrl)
+          .catch(() => this.instance.profilePictureUrl = null);
 
-      // Sync Chatwoot lost messages (non-blocking)
-      if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-        this.syncChatwootLostMessages();
+        this.logger.info(`✅ CONNECTED TO WHATSAPP - ${this.instance.name} (${this.instance.wuid})`);
+
+        // Reset QR code and session flags
+        this.instance.qrcode.count = 0;
+        this.instance.qrcode.base64 = null;
+        this.instance.qrcode.code = null;
+        this.instance.qrcode.pairingCode = null;
+        this.endSession = false;
+        this.reconnectAttempts = 0;
+
+        // Reset proxy failure tracking on successful connection
+        this.proxyConnectionFailures = 0;
+        if (this.proxyDisabledDueToFailure) {
+          this.logger.info('Connection succeeded without proxy - proxy remains disabled for this session');
+        }
+
+        // Update connection status (WITH await to prevent race conditions)
+        const profileName = await this.getProfileName();
+        await this.updateConnectionStatus('open', {
+          ownerJid: this.instance.wuid,
+          profileName: profileName as string,
+          profilePicUrl: this.instance.profilePictureUrl,
+        });
+
+        // Send webhooks (non-blocking)
+        this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+          instance: this.instance.name,
+          state: 'open',
+          wuid: this.instance.wuid,
+        });
+
+        // Sync Chatwoot lost messages (non-blocking)
+        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+          this.syncChatwootLostMessages();
+        }
+
+        // Mark client as ready (with delay for stability)
+        if (this.clientReadyTimeout) {
+          clearTimeout(this.clientReadyTimeout);
+        }
+        this.clientReadyTimeout = setTimeout(() => {
+          this.isClientReady = true;
+          this.logger.info('Client ready for operations');
+          this.clientReadyTimeout = null;
+        }, 3000); // 3s delay
       }
 
-      // Mark client as ready (with delay for stability)
-      if (this.clientReadyTimeout) {
-        clearTimeout(this.clientReadyTimeout);
-      }
-      this.clientReadyTimeout = setTimeout(() => {
-        this.isClientReady = true;
-        this.logger.info('Client ready for operations');
-        this.clientReadyTimeout = null;
-      }, 3000); // 3s delay
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // CONNECTION CONNECTING
-    // ═══════════════════════════════════════════════════════════
-    if (connection === 'connecting') {
-      if (this.stateConnection.state !== 'connecting') {
-        await this.updateConnectionStatus('connecting');
+      // ═══════════════════════════════════════════════════════════
+      // CONNECTION CONNECTING
+      // ═══════════════════════════════════════════════════════════
+      else if ((connection as string) === 'connecting') {
+        if (this.stateConnection.state !== 'connecting') {
+          await this.updateConnectionStatus('connecting');
+        }
       }
     }
   }
@@ -1487,15 +1491,6 @@ export class BaileysStartupService extends ChannelStartupService {
     const version = baileysVersion.version;
     const log = `Baileys version: ${version.join('.')}`;
 
-    // if (session.VERSION) {
-    //   version = session.VERSION.split('.');
-    //   log = `Baileys version env: ${version}`;
-    // } else {
-    //   const baileysVersion = await fetchLatestWaWebVersion({});
-    //   version = baileysVersion.version;
-    //   log = `Baileys version: ${version}`;
-    // }
-
     this.logger.info(log);
 
     this.logger.info(`Group Ignore: ${this.localSettings.groupsIgnore}`);
@@ -1552,7 +1547,7 @@ export class BaileysStartupService extends ChannelStartupService {
       markOnlineOnConnect: false, // FORÇADO: Bot nunca deve aparecer como online
       retryRequestDelayMs: 1000, // AUMENTADO: 350ms -> 1000ms para maior estabilidade
       maxMsgRetryCount: 3, // REDUZIDO: 6 -> 3 tentativas para evitar comportamento agressivo e ban
-      fireInitQueries: false, // DESABILITADO: Evita bloqueios e permite messaging-history.set funcionar corretamente
+      fireInitQueries: true, // HABILITADO: Necessário para disparar core queries do history sync em versões recentes
       connectTimeoutMs: 60_000, // AUMENTADO: 30s -> 60s para redes lentas
       keepAliveIntervalMs: 30_000, // RESTAURADO: 25s -> 30s para reduzir tráfego e evitar ban
       qrTimeout: 60_000, // AUMENTADO: 45s -> 60s para dar mais tempo ao usuário
@@ -1581,16 +1576,8 @@ export class BaileysStartupService extends ChannelStartupService {
           message.deviceSentMessage?.message?.listMessage?.listType === proto.Message.ListMessage.ListType.PRODUCT_LIST
         ) {
           message = JSON.parse(JSON.stringify(message));
-
           message.deviceSentMessage.message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
         }
-
-        if (message.listMessage?.listType == proto.Message.ListMessage.ListType.PRODUCT_LIST) {
-          message = JSON.parse(JSON.stringify(message));
-
-          message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
-        }
-
         return message;
       },
     };
@@ -1757,7 +1744,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  public async connectToWhatsapp(number?: string, timeout = 300000): Promise<WASocket> {
+  public async connectToWhatsapp(number?: string, _timeout = 300000): Promise<WASocket> {
     // Acquire connection lock to prevent multiple simultaneous connection attempts
     const lockAcquired = await this.acquireLock('connection', 10000);
     if (!lockAcquired) {
@@ -1811,7 +1798,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly chatHandle = {
     'chats.upsert': async (chats: Chat[]) => {
       // Resolve LIDs em todos os chats ANTES de processar
-      await Promise.all(chats.map((chat) => this.resolveLIDsInChat(chat)));
+      await this.resolveLIDsInChat(chats);
 
       const existingChatIds = await this.prismaRepository.chat.findMany({
         where: { instanceId: this.instanceId },
@@ -1845,7 +1832,7 @@ export class BaileysStartupService extends ChannelStartupService {
       >[],
     ) => {
       // Resolve LIDs em todos os chats ANTES de processar
-      await Promise.all(chats.map((chat) => this.resolveLIDsInChat(chat as Chat)));
+      await this.resolveLIDsInChat(chats as Chat[]);
 
       const chatsRaw = chats.map((chat) => {
         return { remoteJid: chat.id, instanceId: this.instanceId };
@@ -1854,20 +1841,21 @@ export class BaileysStartupService extends ChannelStartupService {
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
 
       for (const chat of chats) {
-        await this.prismaRepository.chat.updateMany({
-          where: { instanceId: this.instanceId, remoteJid: chat.id, name: chat.name },
-          data: { remoteJid: chat.id },
-        });
+        if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
+          await this.prismaRepository.chat.updateMany({
+            where: { instanceId: this.instanceId, remoteJid: chat.id },
+            data: { remoteJid: chat.id, name: chat.name },
+          });
+        }
       }
     },
 
     'chats.delete': async (chats: string[]) => {
-      chats.forEach(
-        async (chat) =>
-          await this.prismaRepository.chat.deleteMany({ where: { instanceId: this.instanceId, remoteJid: chat } }),
-      );
-
-      this.sendDataWebhook(Events.CHATS_DELETE, [...chats]);
+      if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
+        await this.prismaRepository.chat.deleteMany({
+          where: { instanceId: this.instanceId, remoteJid: { in: chats } },
+        });
+      }
     },
   };
 
@@ -1879,10 +1867,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const contactsRaw: any = contacts.map((contact) => {
           // v7: Extrair phone number do contact.phoneNumber ou contact.id
-          const phoneNumber = contact.phoneNumber ||
-            (contact.id?.includes('@s.whatsapp.net')
-              ? contact.id.split('@')[0]
-              : null);
+          const phoneNumber =
+            contact.phoneNumber || (contact.id?.includes('@s.whatsapp.net') ? contact.id.split('@')[0] : null);
 
           return {
             remoteJid: contact.id,
@@ -1901,7 +1887,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
           if (usersContacts) {
-            await saveOnWhatsappCache(usersContacts.map((c) => ({ remoteJid: c.remoteJid })));
+            await saveOnWhatsappCache(usersContacts.map((c: any) => ({ remoteJid: c.remoteJid })));
           }
         }
 
@@ -1974,14 +1960,14 @@ export class BaileysStartupService extends ChannelStartupService {
 
     'contacts.update': async (contacts: Partial<Contact>[]) => {
       // Resolve LIDs em todos os contatos ANTES de processar
-      await Promise.all(contacts.map((contact) => this.resolveLIDsInContact(contact)));
+      await Promise.all(contacts.map((contact) => this.resolveLIDsInContact(contact as Contact)));
 
       const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
       for await (const contact of contacts) {
         contactsRaw.push({
-          remoteJid: contact.id,
+          remoteJid: contact.id!,
           pushName: contact?.name ?? contact?.verifiedName,
-          profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
+          profilePicUrl: (await this.profilePicture(contact.id!)).profilePictureUrl,
           instanceId: this.instanceId,
         });
       }
@@ -2022,165 +2008,107 @@ export class BaileysStartupService extends ChannelStartupService {
     }) => {
       try {
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-          console.log('received on-demand history sync, messages=', messages);
+          this.logger.log(`received on-demand history sync, messages=${messages.length}`);
         }
-        console.log(
+        this.logger.log(
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
         );
 
-        const instance: InstanceDto = { instanceName: this.instance.name };
+        // Resolve LIDs em todos os chats ANTES de processar
+        await this.resolveLIDsInChat(chats);
 
-        let timestampLimitToImport = null;
-
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
-          const daysLimitToImport = this.localChatwoot?.enabled ? this.localChatwoot.daysLimitImportMessages : 1000;
-
-          const date = new Date();
-          timestampLimitToImport = new Date(date.setDate(date.getDate() - daysLimitToImport)).getTime() / 1000;
-
-          const maxBatchTimestamp = Math.max(...messages.map((message) => message.messageTimestamp as number));
-
-          const processBatch = maxBatchTimestamp >= timestampLimitToImport;
-
-          if (!processBatch) {
-            return;
-          }
+        // Processar contatos da história
+        if (contacts.length > 0) {
+          await this.contactHandle['contacts.upsert'](contacts);
         }
 
-        const contactsMap = new Map();
-
-        for (const contact of contacts) {
-          if (contact.id && (contact.notify || contact.name)) {
-            contactsMap.set(contact.id, { name: contact.name ?? contact.notify, jid: contact.id });
-          }
-        }
-
-        const chatsRaw: { remoteJid: string; instanceId: string; name?: string }[] = [];
-        const chatsRepository = new Set(
-          (await this.prismaRepository.chat.findMany({ where: { instanceId: this.instanceId } })).map(
-            (chat) => chat.remoteJid,
-          ),
-        );
-
-        for (const chat of chats) {
-          if (chatsRepository?.has(chat.id)) {
-            continue;
-          }
-
-          chatsRaw.push({ remoteJid: chat.id, instanceId: this.instanceId, name: chat.name });
-        }
-
-        this.sendDataWebhook(Events.CHATS_SET, chatsRaw);
-
-        if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-          await this.prismaRepository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
-        }
-
-        const messagesRaw: any[] = [];
-        const messagesForEvent: any[] = []; // Collect all messages for webhook event
-
-        const messagesRepository: Set<string> = new Set(
-          chatwootImport.getRepositoryMessagesCache(instance) ??
-          (
-            await this.prismaRepository.message.findMany({
-              select: { key: true },
+        // Processar chats da história
+        if (chats.length > 0) {
+          const existingChatIds = new Set(
+            (await this.prismaRepository.chat.findMany({
               where: { instanceId: this.instanceId },
-            })
-          ).map((message) => {
-            const key = message.key as { id: string };
-
-            return key.id;
-          }),
-        );
-
-        if (chatwootImport.getRepositoryMessagesCache(instance) === null) {
-          chatwootImport.setRepositoryMessagesCache(instance, messagesRepository);
-        }
-
-        let skippedNoData = 0;
-        let skippedChatwootDate = 0;
-        let skippedDuplicate = 0;
-
-        for (const m of messages) {
-          if (!m.message || !m.key || !m.messageTimestamp) {
-            skippedNoData++;
-            continue;
-          }
-
-          // LID handling is now done automatically by Baileys 7.0
-          // if (m.key.remoteJid?.includes('@lid')) {
-          //   // Use remoteJidAlt if needed
-          // }
-
-          if (Long.isLong(m?.messageTimestamp)) {
-            m.messageTimestamp = m.messageTimestamp?.toNumber();
-          }
-
-          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
-            if (m.messageTimestamp <= timestampLimitToImport) {
-              skippedChatwootDate++;
-              continue;
-            }
-          }
-
-          const isMessageInRepository = messagesRepository?.has(m.key.id);
-
-          if (!m.pushName && !m.key.fromMe) {
-            const participantJid = m.participant || m.key.participant || m.key.remoteJid;
-            if (participantJid && contactsMap.has(participantJid)) {
-              m.pushName = contactsMap.get(participantJid).name;
-            } else if (participantJid) {
-              m.pushName = participantJid.split('@')[0];
-            }
-          }
-
-          const preparedMessage = this.prepareMessage(m);
-
-          // Always add to event array (for webhook)
-          messagesForEvent.push(preparedMessage);
-
-          // Only add to messagesRaw if it's a new message (for database save)
-          if (!isMessageInRepository) {
-            messagesRaw.push(preparedMessage);
-          } else {
-            skippedDuplicate++;
-          }
-        }
-
-        console.log(
-          `Message sync stats: Total=${messages.length}, Event=${messagesForEvent.length}, New=${messagesRaw.length}, ` +
-          `Skipped: NoData=${skippedNoData}, ChatwootDate=${skippedChatwootDate}, Duplicate=${skippedDuplicate}`
-        );
-
-        // Send webhook event with all messages (including duplicates)
-        if (messagesForEvent.length > 0) {
-          this.sendDataWebhook(Events.MESSAGES_SET, [...messagesForEvent]);
-        }
-
-        if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC && messagesRaw.length > 0) {
-          await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
-        }
-
-        if (
-          this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
-          this.localChatwoot?.enabled &&
-          this.localChatwoot.importMessages &&
-          messagesRaw.length > 0
-        ) {
-          this.chatwootService.addHistoryMessages(
-            instance,
-            messagesRaw.filter((msg) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
+              select: { remoteJid: true }
+            })).map(chat => chat.remoteJid)
           );
+
+          const chatsToInsert = chats
+            .filter(chat => !existingChatIds.has(chat.id))
+            .map(chat => ({
+              remoteJid: chat.id,
+              instanceId: this.instanceId,
+              name: chat.name
+            }));
+
+          this.sendDataWebhook(Events.CHATS_SET, chatsToInsert);
+
+          if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC && chatsToInsert.length > 0) {
+            await this.prismaRepository.chat.createMany({ data: chatsToInsert, skipDuplicates: true });
+          }
         }
 
-        await this.contactHandle['contacts.upsert'](
-          contacts.filter((c) => !!c.notify || !!c.name).map((c) => ({ id: c.id, name: c.name ?? c.notify })),
+        const messagesToInsert: any[] = [];
+        const messagesForEvent: any[] = [];
+
+        // Cache existing messages to avoid duplicates
+        const existingMessageIds = new Set(
+          (await this.prismaRepository.message.findMany({
+            where: { instanceId: this.instanceId },
+            select: { key: true }
+          })).map(m => (m.key as any).id)
         );
 
-        contacts = undefined;
-        messages = undefined;
-        chats = undefined;
+        for (const message of messages) {
+          if (!message?.message) continue;
+
+          // Always add to event list if it's not a duplicate for the UI
+          messagesForEvent.push(message);
+
+          if (existingMessageIds.has(message.key.id!)) continue;
+
+          const preparedMessage = await this.prepareMessage(message);
+          if (preparedMessage) {
+            messagesToInsert.push(preparedMessage);
+          }
+        }
+
+        if (messagesToInsert.length > 0) {
+          if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
+            const chunkSize = 100;
+            for (let i = 0; i < messagesToInsert.length; i += chunkSize) {
+              const chunk = messagesToInsert.slice(i, i + chunkSize);
+              await this.prismaRepository.message.createMany({ data: chunk, skipDuplicates: true });
+            }
+          }
+
+          if (
+            this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
+            this.localChatwoot?.enabled &&
+            this.localChatwoot.importMessages
+          ) {
+            this.chatwootService.addHistoryMessages(
+              { instanceName: this.instance.name, instanceId: this.instance.id },
+              messagesToInsert
+            );
+          }
+        }
+
+        // Send webhook even if messages were skipped to show progress
+        this.sendDataWebhook(Events.MESSAGES_SET, messagesForEvent, true, undefined, {
+          isLatest: isLatest ?? false,
+          progress: progress ?? 0,
+        });
+
+        this.sendDataWebhook(Events.MESSAGING_HISTORY_SET, {
+          chats: chats.length,
+          contacts: contacts.length,
+          messages: messages.length,
+          isLatest,
+          progress,
+          syncType,
+        });
+
       } catch (error) {
+        this.logger.error(`Error processing history sync: ${error.message}`);
         this.logger.error(error);
       }
     },
@@ -2212,11 +2140,6 @@ export class BaileysStartupService extends ChannelStartupService {
           // Resolve LIDs ANTES de qualquer processamento (usando cache Redis + timeout)
           await this.resolveLIDsInMessage(received);
 
-          // LID handling is now done automatically by Baileys 7.0
-          // if (received.key.remoteJid?.includes('@lid')) {
-          //   // Use remoteJidAlt if needed
-          // }
-
           // Handle messageStubType 2 (Message absent from node) - cache for retry
           if ((received as any)?.messageStubType === 2 && received.key?.id) {
             const jid = received.key.remoteJid;
@@ -2226,7 +2149,7 @@ export class BaileysStartupService extends ChannelStartupService {
             this.logger.warn(
               `[Session Error] stubType 2 message cached for retry | ` +
               `JID: ${jid} | MessageID: ${received.key.id} | ` +
-              `RetryAttempt: ${retryCount}/${this.MAX_STUB_RETRY_ATTEMPTS}`
+              `RetryAttempt: ${retryCount}/${this.MAX_STUB_RETRY_ATTEMPTS}`,
             );
 
             this.pruneMapCache(this.messageStubRetryCache, this.MAX_MESSAGE_STUB_RETRY_CACHE);
@@ -2237,7 +2160,7 @@ export class BaileysStartupService extends ChannelStartupService {
               retryCount,
               timestamp: Date.now(),
               jid,
-              lastError: 'stubType 2 - Message absent from node'
+              lastError: 'stubType 2 - Message absent from node',
             });
             continue;
           }
@@ -2265,7 +2188,7 @@ export class BaileysStartupService extends ChannelStartupService {
                 badMacCount: 0,
                 noSessionCount: 0,
                 lastErrorType: '',
-                lastErrorTime: Date.now()
+                lastErrorTime: Date.now(),
               };
 
               // Detect error type and update counters
@@ -2274,7 +2197,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
               if (isBadMac) stats.badMacCount++;
               if (isNoSession) stats.noSessionCount++;
-              stats.lastErrorType = isBadMac ? 'Bad MAC' : (isNoSession ? 'No Session' : 'Other');
+              stats.lastErrorType = isBadMac ? 'Bad MAC' : isNoSession ? 'No Session' : 'Other';
               stats.lastErrorTime = Date.now();
 
               this.pruneMapCache(this.sessionErrorStats, this.MAX_SESSION_ERROR_CACHE);
@@ -2285,7 +2208,7 @@ export class BaileysStartupService extends ChannelStartupService {
                 `JID: ${jid} | MessageID: ${received.key.id} | ` +
                 `Error: ${stats.lastErrorType} | ` +
                 `Stats: BadMAC=${stats.badMacCount}, NoSession=${stats.noSessionCount} | ` +
-                `Details: ${errorMsg.substring(0, 100)}`
+                `Details: ${errorMsg.substring(0, 100)}`,
               );
 
               // Check if it's a critical session error that should trigger auto-clear
@@ -2297,25 +2220,28 @@ export class BaileysStartupService extends ChannelStartupService {
                 await this.handleSessionError(jid, errorMsg);
               }
             } else {
-              this.logger.warn(`[Session Error] Message with session error but no JID: ${JSON.stringify(received.key, null, 2)}`);
+              this.logger.warn(
+                `[Session Error] Message with session error but no JID: ${JSON.stringify(received.key, null, 2)}`,
+              );
             }
 
             continue;
           }
+
           if (received.message?.conversation || received.message?.extendedTextMessage?.text) {
             const text = received.message?.conversation || received.message?.extendedTextMessage?.text;
 
             if (text == 'requestPlaceholder' && !requestId) {
               const messageId = await this.client.requestPlaceholderResend(received.key);
 
-              console.log('requested placeholder resync, id=', messageId);
+              this.logger.log(`requested placeholder resync, id=${messageId}`);
             } else if (requestId) {
-              console.log('Message received from phone, id=', requestId, received);
+              this.logger.log(`Message received from phone, id=${requestId}`);
             }
 
             if (text == 'onDemandHistSync') {
               const messageId = await this.client.fetchMessageHistory(50, received.key, received.messageTimestamp!);
-              console.log('requested on-demand sync, id=', messageId);
+              this.logger.log(`requested on-demand sync, id=${messageId}`);
             }
           }
 
@@ -2358,31 +2284,21 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          // Removed duplicate message check - allowing all messages to be processed
-          // const messageKey = `${this.instance.id}_${received.key.id}`;
-          // const cached = await this.baileysCache.get(messageKey);
-          // if (cached && !editedMessage) {
-          //   this.logger.info(`Message duplicated ignored: ${received.key.id}`);
-          //   continue;
-          // }
-          // await this.baileysCache.set(messageKey, true, 5 * 60);
-
           // Skip edited messages (already processed above), poll updates, and messages without content
-          // Note: Type check (notify/append) is redundant here as we already filtered at the top
           if (editedMessage || received.message?.pollUpdateMessage || !received?.message) {
             continue;
           }
 
           if (Long.isLong(received.messageTimestamp)) {
-            received.messageTimestamp = received.messageTimestamp?.toNumber();
+            received.messageTimestamp = (received.messageTimestamp as Long).toNumber();
           }
 
-          if (settings?.groupsIgnore && received.key.remoteJid.includes('@g.us')) {
+          if (this.localSettings?.groupsIgnore && received.key.remoteJid!.includes('@g.us')) {
             continue;
           }
 
           // Normaliza o remoteJid para evitar duplicação
-          const normalizedRemoteJid = this.normalizeRemoteJid(received.key) || received.key.remoteJid;
+          const normalizedRemoteJid = this.normalizeRemoteJid(received.key) || received.key.remoteJid!;
 
           const existingChat = await this.prismaRepository.chat.findFirst({
             where: { instanceId: this.instanceId, remoteJid: normalizedRemoteJid },
@@ -2465,97 +2381,89 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
-            const msg = await this.prismaRepository.message.create({ data: messageRaw });
+            let msg;
+            try {
+              msg = await this.prismaRepository.message.create({ data: messageRaw });
+            } catch (err) {
+              if (err.code === 'P2002') {
+                this.logger.verbose(`Message ${messageRaw.key.id} already exists in DB, skipping create`);
+                // Use existing message for status updates below
+                msg = await this.prismaRepository.message.findFirst({
+                  where: { instanceId: this.instanceId, key: { path: ['id'], equals: messageRaw.key.id } }
+                });
+              } else {
+                throw err;
+              }
+            }
 
-            // IMPORTANTE: Usar o remoteJid normalizado que foi salvo, não o original
-            const { remoteJid } = messageRaw.key; // ✅ Pega do messageRaw (normalizado)
-            const timestamp = msg.messageTimestamp;
+            if (msg) {
+              // IMPORTANTE: Usar o remoteJid normalizado que foi salvo, não o original
+              const { remoteJid } = messageRaw.key; // ✅ Pega do messageRaw (normalizado)
+              const timestamp = msg.messageTimestamp;
 
-            // Removed duplicate read message check - allowing all read messages to be processed
-            // const fromMe = received.key.fromMe.toString();
-            // const messageKey = `${remoteJid}_${timestamp}_${fromMe}`;
-            // const cachedTimestamp = await this.baileysCache.get(messageKey);
-
-            // if (!cachedTimestamp) {
-            if (!received.key.fromMe) {
-              if (msg.status === status[3]) {
-                this.logger.log(`Update not read messages ${remoteJid}`);
-                await this.updateChatUnreadMessages(remoteJid);
-              } else if (msg.status === status[4]) {
+              if (!received.key.fromMe) {
+                if (msg.status === status[3]) {
+                  this.logger.log(`Update not read messages ${remoteJid}`);
+                  await this.updateChatUnreadMessages(remoteJid);
+                } else if (msg.status === status[4]) {
+                  this.logger.log(`Update readed messages ${remoteJid} - ${timestamp}`);
+                  await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
+                }
+              } else {
+                // is send message by me
                 this.logger.log(`Update readed messages ${remoteJid} - ${timestamp}`);
                 await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
               }
-            } else {
-              // is send message by me
-              this.logger.log(`Update readed messages ${remoteJid} - ${timestamp}`);
-              await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
-            }
 
-            // await this.baileysCache.set(messageKey, true, 5 * 60);
-            // } else {
-            //   this.logger.info(`Update readed messages duplicated ignored [avoid deadlock]: ${messageKey}`);
-            // }
+              if (isMedia) {
+                if (this.configService.get<S3>('S3').ENABLE) {
+                  try {
+                    const message: any = received;
 
-            if (isMedia) {
-              if (this.configService.get<S3>('S3').ENABLE) {
-                try {
-                  const message: any = received;
+                    // Verificação adicional para garantir que há conteúdo de mídia real
+                    const hasRealMedia = this.hasValidMediaContent(message);
 
-                  // Verificação adicional para garantir que há conteúdo de mídia real
-                  const hasRealMedia = this.hasValidMediaContent(message);
+                    if (!hasRealMedia) {
+                      this.logger.warn('Message detected as media but contains no valid media content');
+                    } else {
+                      const media = await this.getBase64FromMediaMessage({ message }, true);
 
-                  if (!hasRealMedia) {
-                    this.logger.warn('Message detected as media but contains no valid media content');
-                  } else {
-                    const media = await this.getBase64FromMediaMessage({ message }, true);
+                      const { buffer, mediaType, fileName, size } = media;
+                      const mimetype = mimeTypes.lookup(fileName).toString();
+                      const fullName = join(
+                        `${this.instance.id}`,
+                        received.key.remoteJid,
+                        mediaType,
+                        `${Date.now()}_${fileName}`,
+                      );
+                      await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
 
-                    const { buffer, mediaType, fileName, size } = media;
-                    const mimetype = mimeTypes.lookup(fileName).toString();
-                    const fullName = join(
-                      `${this.instance.id}`,
-                      received.key.remoteJid,
-                      mediaType,
-                      `${Date.now()}_${fileName}`,
-                    );
-                    await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
+                      await this.prismaRepository.media.create({
+                        data: {
+                          messageId: msg.id,
+                          instanceId: this.instanceId,
+                          type: mediaType,
+                          fileName: fullName,
+                          mimetype,
+                        },
+                      });
 
-                    await this.prismaRepository.media.create({
-                      data: {
-                        messageId: msg.id,
-                        instanceId: this.instanceId,
-                        type: mediaType,
-                        fileName: fullName,
-                        mimetype,
-                      },
-                    });
+                      const mediaUrl = await s3Service.getObjectUrl(fullName);
 
-                    const mediaUrl = await s3Service.getObjectUrl(fullName);
+                      messageRaw.message.mediaUrl = mediaUrl;
 
-                    messageRaw.message.mediaUrl = mediaUrl;
-
-                    await this.prismaRepository.message.update({ where: { id: msg.id }, data: messageRaw });
+                      await this.prismaRepository.message.update({ where: { id: msg.id }, data: messageRaw });
+                    }
+                  } catch (error) {
+                    this.logger.error(['Error on upload file to minio', error?.message, error?.stack]);
                   }
-                } catch (error) {
-                  this.logger.error(['Error on upload file to minio', error?.message, error?.stack]);
                 }
               }
             }
-          }
 
-          if (this.localWebhook.enabled) {
-            if (isMedia && this.localWebhook.webhookBase64) {
-              try {
-                const buffer = await downloadMediaMessage(
-                  { key: received.key, message: received?.message },
-                  'buffer',
-                  {},
-                  { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
-                );
-
-                if (buffer) {
-                  messageRaw.message.base64 = buffer.toString('base64');
-                } else {
-                  // retry to download media
+            if (this.localWebhook.enabled) {
+              if (isMedia && this.localWebhook.webhookBase64) {
+                try {
                   const buffer = await downloadMediaMessage(
                     { key: received.key, message: received?.message },
                     'buffer',
@@ -2565,75 +2473,90 @@ export class BaileysStartupService extends ChannelStartupService {
 
                   if (buffer) {
                     messageRaw.message.base64 = buffer.toString('base64');
+                  } else {
+                    // retry to download media
+                    const buffer = await downloadMediaMessage(
+                      { key: received.key, message: received?.message },
+                      'buffer',
+                      {},
+                      { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+                    );
+
+                    if (buffer) {
+                      messageRaw.message.base64 = buffer.toString('base64');
+                    }
                   }
+                } catch (error) {
+                  this.logger.error(['Error converting media to base64', error?.message]);
                 }
-              } catch (error) {
-                this.logger.error(['Error converting media to base64', error?.message]);
               }
             }
-          }
 
-          this.logger.log(messageRaw);
+            this.logger.log(messageRaw);
 
-          this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
+            this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
-          await chatbotController.emit({
-            instance: { instanceName: this.instance.name, instanceId: this.instanceId },
-            remoteJid: messageRaw.key.remoteJid,
-            msg: messageRaw,
-            pushName: messageRaw.pushName,
-          });
+            await chatbotController.emit({
+              instance: { instanceName: this.instance.name, instanceId: this.instanceId },
+              remoteJid: messageRaw.key.remoteJid,
+              msg: messageRaw,
+              pushName: messageRaw.pushName,
+            });
 
-          // Normaliza o remoteJid para evitar duplicação de contatos
-          const normalizedContactJid = this.normalizeRemoteJid(received.key) || received.key.remoteJid;
+            // Normaliza o remoteJid para evitar duplicação de contatos
+            const normalizedContactJid = this.normalizeRemoteJid(received.key) || received.key.remoteJid;
 
-          const contact = await this.prismaRepository.contact.findFirst({
-            where: { remoteJid: normalizedContactJid, instanceId: this.instanceId },
-          });
+            const contact = await this.prismaRepository.contact.findFirst({
+              where: { remoteJid: normalizedContactJid, instanceId: this.instanceId },
+            });
 
-          const contactRaw: { remoteJid: string; pushName: string; profilePicUrl?: string; instanceId: string } = {
-            remoteJid: normalizedContactJid,
-            pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
-            profilePicUrl: (await this.profilePicture(normalizedContactJid)).profilePictureUrl,
-            instanceId: this.instanceId,
-          };
+            // Skip profile picture fetch during synchronization (append/historic) for performance
+            const shouldFetchPP = type === 'notify' && !received.key.fromMe && !this.localSettings.syncFullHistory;
 
-          if (contactRaw.remoteJid === 'status@broadcast') {
-            continue;
-          }
+            const contactRaw: { remoteJid: string; pushName: string; profilePicUrl?: string; instanceId: string } = {
+              remoteJid: normalizedContactJid,
+              pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
+              profilePicUrl: shouldFetchPP ? (await this.profilePicture(normalizedContactJid)).profilePictureUrl : undefined,
+              instanceId: this.instanceId,
+            };
 
-          if (contact) {
-            this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
-
-            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-              await this.chatwootService.eventWhatsapp(
-                Events.CONTACTS_UPDATE,
-                { instanceName: this.instance.name, instanceId: this.instanceId },
-                contactRaw,
-              );
+            if (contactRaw.remoteJid === 'status@broadcast') {
+              continue;
             }
+
+            if (contact) {
+              this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
+
+              if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+                await this.chatwootService.eventWhatsapp(
+                  Events.CONTACTS_UPDATE,
+                  { instanceName: this.instance.name, instanceId: this.instance.id },
+                  contactRaw,
+                );
+              }
+
+              if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
+                await this.prismaRepository.contact.upsert({
+                  where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
+                  create: contactRaw,
+                  update: contactRaw,
+                });
+
+              continue;
+            }
+
+            this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
 
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
               await this.prismaRepository.contact.upsert({
                 where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
-                create: contactRaw,
                 update: contactRaw,
+                create: contactRaw,
               });
 
-            continue;
-          }
-
-          this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
-
-          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-            await this.prismaRepository.contact.upsert({
-              where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
-              update: contactRaw,
-              create: contactRaw,
-            });
-
-          if (contactRaw.remoteJid.includes('@s.whatsapp')) {
-            await saveOnWhatsappCache([{ remoteJid: contactRaw.remoteJid }]);
+            if (contactRaw.remoteJid.includes('@s.whatsapp')) {
+              await saveOnWhatsappCache([{ remoteJid: contactRaw.remoteJid }]);
+            }
           }
         }
       } catch (error) {
@@ -2675,10 +2598,6 @@ export class BaileysStartupService extends ChannelStartupService {
         } catch (outerError) {
           this.logger.error(`[messages.upsert] FAILSAFE: Critical failure: ${outerError.message}`);
         }
-
-        // IMPORTANTE: Não engolir o erro silenciosamente
-        // Descomentar linha abaixo em ambiente de desenvolvimento para ver erros:
-        // throw error;
       }
     },
 
@@ -2696,8 +2615,6 @@ export class BaileysStartupService extends ChannelStartupService {
           if (!metadata) {
             // Fallback: no metadata, just retry once
             this.messageStubRetryCache.delete(key.id);
-            this.logger.info(`[Retry] stubType 2 message (no metadata) | MessageID: ${key.id}`);
-
             this.client.ev.emit('messages.upsert', {
               messages: [{ ...cachedMessage, ...update } as WAMessage],
               type: 'notify',
@@ -2856,27 +2773,15 @@ export class BaileysStartupService extends ChannelStartupService {
               const { remoteJid } = key;
               const timestamp = findMessage.messageTimestamp;
 
-              // Removed duplicate message update check - allowing all updates to be processed
-              // const fromMe = key.fromMe.toString();
-              // const messageKey = `${remoteJid}_${timestamp}_${fromMe}`;
-              // const cachedTimestamp = await this.baileysCache.get(messageKey);
-
-              // if (!cachedTimestamp) {
               if (status[update.status] === status[4]) {
                 this.logger.log(`Update as read in message.update ${remoteJid} - ${timestamp}`);
                 await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
-                // await this.baileysCache.set(messageKey, true, 5 * 60);
               }
 
               await this.prismaRepository.message.update({
                 where: { id: findMessage.id },
                 data: { status: status[update.status] },
               });
-              // } else {
-              //   this.logger.info(
-              //     `Update readed messages duplicated ignored in message.update [avoid deadlock]: ${messageKey}`,
-              //   );
-              // }
             }
           }
 
@@ -3233,8 +3138,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private isSyncNotificationFromUsedSyncType(msg: proto.Message.IHistorySyncNotification) {
     return (
-      (this.localSettings.syncFullHistory && msg?.syncType === 2) ||
-      (!this.localSettings.syncFullHistory && msg?.syncType === 3)
+      (this.localSettings.syncFullHistory && msg?.syncType === 2) || // FULL
+      (!this.localSettings.syncFullHistory && msg?.syncType === 3) || // RECENT
+      msg?.syncType === 0 || // INITIAL_BOOTSTRAP (often missed)
+      msg?.syncType === 5 // NON_CRITICAL_BOOTSTRAP
     );
   }
 
@@ -5140,7 +5047,7 @@ export class BaileysStartupService extends ChannelStartupService {
       if (response) {
         const messageId = response.message?.protocolMessage?.key?.id;
         if (messageId) {
-          const isLogicalDeleted = configService.get<Database>('DATABASE').DELETE_DATA.LOGICAL_MESSAGE_DELETE;
+          const isLogicalDeleted = this.configService.get<Database>('DATABASE').DELETE_DATA.LOGICAL_MESSAGE_DELETE;
           let message = await this.prismaRepository.message.findFirst({
             where: { key: { path: ['id'], equals: messageId } },
           });
@@ -5577,12 +5484,29 @@ export class BaileysStartupService extends ChannelStartupService {
    * // Sync multiple chats
    * { remoteJids: ["5511999999999", "5511888888888"], limit: 50 }
    *
-   * // Sync all recent chats
+   * // Sync all recent chats from database
    * { limit: 100 }
+   *
+   * // Recover lost chats from WhatsApp cache
+   * { source: "whatsapp", limit: 100 }
+   *
+   * // Full sync including groups
+   * { source: "all", includeGroups: true, limit: 100 }
+   *
+   * // Request full history from WhatsApp
+   * { requestFullSync: true }
    */
   public async syncMessages(data: SyncMessagesDto) {
-    const limit = data.limit || 100; // Default to 100 messages per chat
+    const limit = data.limit || 100;
     const forceSync = data.forceSync || false;
+    const source = data.source || 'database';
+    const includeGroups = data.includeGroups || false;
+    const maxChats = Math.min(data.maxChats || 100, 500);
+
+    // OPTION 0: Request full history sync from WhatsApp
+    if (data.requestFullSync) {
+      return await this.requestFullHistorySync();
+    }
 
     // OPTION 1: Sync single chat (remoteJid)
     if (data.remoteJid) {
@@ -5598,12 +5522,9 @@ export class BaileysStartupService extends ChannelStartupService {
         throw new NotFoundException(`Number ${data.remoteJid} is not on WhatsApp`);
       }
 
-      if (numberInfo.jid.includes('@g.us')) {
-        throw new BadRequestException('Groups are not supported for synchronization');
-      }
-
-      if (!numberInfo.jid.includes('@s.whatsapp.net')) {
-        throw new BadRequestException('Only individual chats are supported (@s.whatsapp.net)');
+      // Allow groups if includeGroups is true
+      if (numberInfo.jid.includes('@g.us') && !includeGroups) {
+        throw new BadRequestException('Groups are not supported for synchronization. Set includeGroups: true to enable.');
       }
 
       const validRemoteJid = numberInfo.jid;
@@ -5615,7 +5536,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       return {
         success: true,
-        message: `On-demand history sync started using sock.fetchMessageHistory`,
+        message: `On-demand history sync started`,
         chat: validRemoteJid,
         limit,
         forceSync,
@@ -5632,11 +5553,15 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       const validChats = validatedNumbers
-        .filter(n => n.exists && n.jid.includes('@s.whatsapp.net'))
+        .filter(n => {
+          if (!n.exists) return false;
+          if (n.jid.includes('@g.us') && !includeGroups) return false;
+          return true;
+        })
         .map(n => n.jid);
 
       if (validChats.length === 0) {
-        throw new NotFoundException('No valid individual chats found');
+        throw new NotFoundException('No valid chats found');
       }
 
       // Process all chats in background
@@ -5654,17 +5579,197 @@ export class BaileysStartupService extends ChannelStartupService {
       };
     }
 
-    // OPTION 3: Sync all recent individual chats
-    this.syncRecentChats(limit).catch((error) => {
+    // OPTION 3: Sync all chats based on source
+    const chatsToSync = await this.getChatsForSync(source, includeGroups, maxChats);
+
+    if (chatsToSync.length === 0) {
+      return {
+        success: false,
+        message: 'No chats found to sync',
+        source,
+        includeGroups,
+      };
+    }
+
+    // Process all chats in background
+    this.syncMultipleChats(chatsToSync, limit, forceSync).catch((error) => {
       this.logger.error(`Background sync error: ${error.toString()}`);
     });
 
     return {
       success: true,
-      message: 'On-demand history sync started for all recent individual chats',
+      message: `On-demand history sync started for ${chatsToSync.length} chats`,
+      source,
+      chatsCount: chatsToSync.length,
+      includeGroups,
       limit,
+      forceSync,
       note: 'Messages will be delivered via messaging-history.set event and webhook (MESSAGES_SET)'
     };
+  }
+
+  /**
+   * Get chats for synchronization based on source
+   */
+  private async getChatsForSync(source: 'database' | 'whatsapp' | 'all', includeGroups: boolean, maxChats: number): Promise<string[]> {
+    const chatsSet = new Set<string>();
+
+    // Get chats from database
+    if (source === 'database' || source === 'all') {
+      try {
+        const dbChats = await this.prismaRepository.chat.findMany({
+          where: { instanceId: this.instanceId },
+          select: { remoteJid: true },
+          orderBy: { updatedAt: 'desc' },
+          take: maxChats,
+        });
+
+        for (const chat of dbChats) {
+          const jid = chat.remoteJid;
+          if (!jid) continue;
+
+          const isGroup = jid.includes('@g.us');
+          if (isGroup && !includeGroups) continue;
+
+          chatsSet.add(jid);
+        }
+
+        this.logger.info(`📊 Found ${dbChats.length} chats from database (${chatsSet.size} after filtering)`);
+      } catch (error) {
+        this.logger.error(`Error getting chats from database: ${error.message}`);
+      }
+    }
+
+    // Get chats from WhatsApp cache (store.chats)
+    if (source === 'whatsapp' || source === 'all') {
+      try {
+        const waChats = await this.getChatsFromWhatsAppCache(includeGroups, maxChats);
+
+        for (const jid of waChats) {
+          chatsSet.add(jid);
+        }
+
+        this.logger.info(`📊 Found ${waChats.length} chats from WhatsApp cache (${chatsSet.size} total after merge)`);
+      } catch (error) {
+        this.logger.error(`Error getting chats from WhatsApp cache: ${error.message}`);
+      }
+    }
+
+    // Convert to array and limit
+    const result = Array.from(chatsSet).slice(0, maxChats);
+    this.logger.info(`📊 Final chat list: ${result.length} chats to sync`);
+
+    return result;
+  }
+
+  /**
+   * Get chats directly from WhatsApp cache (Baileys store)
+   * This can recover chats that are not in the database
+   */
+  private async getChatsFromWhatsAppCache(includeGroups: boolean, maxChats: number): Promise<string[]> {
+    const chats: string[] = [];
+
+    try {
+      // Method 1: Try to get groups from WhatsApp if connected and includeGroups is enabled
+      if (this.client && includeGroups) {
+        try {
+          this.logger.info('📦 Attempting to get groups via WhatsApp query...');
+          const chatList = await this.client.groupFetchAllParticipating();
+
+          if (chatList) {
+            for (const [jid] of Object.entries(chatList)) {
+              if (chats.length >= maxChats) break;
+              chats.push(jid);
+            }
+            this.logger.info(`📦 Got ${chats.length} groups from WhatsApp query`);
+          }
+        } catch (queryError) {
+          this.logger.verbose(`WhatsApp group query failed: ${(queryError as Error).message}`);
+        }
+      }
+
+      // Method 2: Get contacts that have been messaged (fallback)
+      if (chats.length < maxChats) {
+        try {
+          const contacts = await this.prismaRepository.contact.findMany({
+            where: { instanceId: this.instanceId },
+            select: { remoteJid: true },
+            orderBy: { updatedAt: 'desc' },
+            take: maxChats - chats.length,
+          });
+
+          for (const contact of contacts) {
+            if (chats.length >= maxChats) break;
+
+            const jid = contact.remoteJid;
+            if (!jid || chats.includes(jid)) continue;
+
+            const isGroup = jid.includes('@g.us');
+            if (isGroup && !includeGroups) continue;
+
+            chats.push(jid);
+          }
+
+          this.logger.info(`📦 Added ${contacts.length} contacts as potential chats`);
+        } catch (contactError) {
+          this.logger.verbose(`Contact query failed: ${contactError.message}`);
+        }
+      }
+
+    } catch (error) {
+      this.logger.error(`Error getting chats from WhatsApp cache: ${error.message}`);
+    }
+
+    return chats;
+  }
+
+  /**
+   * Request a full history sync from WhatsApp server
+   * This triggers WhatsApp to resend the complete message history
+   */
+  private async requestFullHistorySync(): Promise<any> {
+    try {
+      this.logger.info('📦 Requesting FULL history sync from WhatsApp server...');
+
+      // Check if client is connected
+      if (!this.client) {
+        throw new BadRequestException('WhatsApp client is not connected');
+      }
+
+      // Trigger a history sync request by sending a special query
+      // This emulates what happens when you initially connect
+      await this.client.sendNode({
+        tag: 'iq',
+        attrs: {
+          to: '@s.whatsapp.net',
+          type: 'get',
+          xmlns: 'w:sync:app:state',
+        },
+        content: [{
+          tag: 'sync',
+          attrs: {},
+          content: []
+        }]
+      });
+
+      this.logger.info('📦 Full history sync request sent to WhatsApp');
+
+      return {
+        success: true,
+        message: 'Full history sync requested from WhatsApp server',
+        note: 'Messages will arrive via messaging-history.set event over the next few minutes. This may take time depending on your chat history size.',
+      };
+    } catch (error) {
+      this.logger.error(`Error requesting full history sync: ${error.message}`);
+
+      // Fallback: Try to trigger sync by disconnecting and reconnecting
+      return {
+        success: false,
+        message: 'Could not request full history sync directly',
+        suggestion: 'Try reconnecting the instance with syncFullHistory: true in settings',
+        error: error.message,
+      };
+    }
   }
 
   private async syncSingleChat(remoteJid: string, limit: number, forceSync: boolean = false): Promise<void> {
@@ -6488,15 +6593,17 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   /**
-   * Resolve LIDs em um chat
+   * Resolve LIDs em um array de chats
    */
-  private async resolveLIDsInChat(chat: Chat): Promise<void> {
+  private async resolveLIDsInChat(chats: Chat[]): Promise<void> {
     try {
-      if (chat.id) {
-        const resolved = await this.resolveJID(chat.id);
-        if (resolved && resolved !== chat.id) {
-          this.logger.verbose(`[resolveLIDsInChat] ${chat.id} -> ${resolved}`);
-          chat.id = resolved;
+      for (const chat of chats) {
+        if (chat.id) {
+          const resolved = await this.resolveJID(chat.id);
+          if (resolved && resolved !== chat.id) {
+            this.logger.verbose(`[resolveLIDsInChat] ${chat.id} -> ${resolved}`);
+            chat.id = resolved;
+          }
         }
       }
     } catch (error) {

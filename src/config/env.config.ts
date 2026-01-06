@@ -122,6 +122,7 @@ export type Sqs = {
 export type Websocket = {
   ENABLED: boolean;
   GLOBAL_EVENTS: boolean;
+  ALLOWED_HOSTS?: string;
 };
 
 export type WaBusiness = {
@@ -473,6 +474,7 @@ export class ConfigService {
       WEBSOCKET: {
         ENABLED: process.env?.WEBSOCKET_ENABLED === 'true',
         GLOBAL_EVENTS: process.env?.WEBSOCKET_GLOBAL_EVENTS === 'true',
+        ALLOWED_HOSTS: process.env?.WEBSOCKET_ALLOWED_HOSTS || '127.0.0.1,::1,::ffff:127.0.0.1',
       },
       PUSHER: {
         ENABLED: process.env?.PUSHER_ENABLED === 'true',

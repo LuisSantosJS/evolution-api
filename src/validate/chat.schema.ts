@@ -5,10 +5,10 @@ const isNotEmpty = (...propertyNames: string[]): JSONSchema7 => {
   const properties = {};
   propertyNames.forEach(
     (property) =>
-      (properties[property] = {
-        minLength: 1,
-        description: `The "${property}" cannot be empty`,
-      }),
+    (properties[property] = {
+      minLength: 1,
+      description: `The "${property}" cannot be empty`,
+    }),
   );
   return {
     if: {
@@ -198,6 +198,25 @@ export const syncMessagesSchema: JSONSchema7 = {
       maxItems: 50, // Max 50 chats at once
     },
     forceSync: { type: 'boolean' },
+    source: {
+      type: 'string',
+      enum: ['database', 'whatsapp', 'all'],
+      description: 'Source to get chats from: database (default), whatsapp (recovers lost chats), or all',
+    },
+    includeGroups: {
+      type: 'boolean',
+      description: 'Include group chats in sync (default: false)',
+    },
+    maxChats: {
+      type: 'integer',
+      minimum: 1,
+      maximum: 500,
+      description: 'Maximum number of chats to sync (default: 100)',
+    },
+    requestFullSync: {
+      type: 'boolean',
+      description: 'Force requesting full history from WhatsApp server',
+    },
   },
 };
 
