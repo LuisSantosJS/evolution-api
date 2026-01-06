@@ -323,6 +323,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private isClientReady = false;
   private clientReadyTimeout: NodeJS.Timeout | null = null; // NOVO: Para limpar timeout
+  private reconnectTimeout: NodeJS.Timeout | null = null; // NOVO: Para gerenciar reconexões
 
   // Status synchronization
   private statusUpdateLock = false;
@@ -1297,124 +1298,106 @@ export class BaileysStartupService extends ChannelStartupService {
       });
 
       if (shouldReconnect) {
-        // Check max reconnection attempts
-        const MAX_RECONNECT_ATTEMPTS = 10;
-        if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-          if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-            this.logger.error(`Maximum reconnection attempts (${MAX_RECONNECT_ATTEMPTS}) reached - stopping`);
-            this.sendDataWebhook(Events.CONNECTION_UPDATE, {
-              instance: this.instance.name,
-              state: 'close',
-              message: 'Max reconnection attempts reached',
-            });
-            return;
-          }
+        this.reconnectAttempts++;
+        const MAX_RECONNECT_ATTEMPTS = 15; // Increased for better stability
 
-          // Acquire reconnection lock to prevent simultaneous reconnects
-          const lockAcquired = await this.acquireLock('reconnect', 5000);
-          if (!lockAcquired) {
-            this.logger.warn('Reconnection already in progress - skipping');
-            return;
-          }
-
-          this.reconnectAttempts++;
-
-          // Exponential backoff: 2s, 4s, 8s, 16s, 30s (max)
+        if (this.reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+          // Exponential backoff
           const delayMs = Math.min(2000 * Math.pow(2, this.reconnectAttempts - 1), 30000);
+          this.logger.info(`Reconnecting in ${delayMs}ms (attempt #${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
 
-          this.logger.info(`Scheduling reconnection in ${delayMs}ms (attempt #${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
-
-          setTimeout(async () => {
+          if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
+          this.reconnectTimeout = setTimeout(async () => {
             try {
+              // Ensure we release any previous connection locks if they timed out
+              this.releaseLock('connection');
               await this.connectToWhatsapp(this.phoneNumber);
-            } catch (error) {
-              this.logger.error(`Reconnection failed: ${error.message}`);
-            } finally {
-              this.releaseLock('reconnect');
+            } catch (err) {
+              this.logger.error(`Reconnection attempt failed: ${err.message}`);
             }
           }, delayMs);
         } else {
-          // Permanent disconnection - cleanup
-          this.logger.info('Permanent disconnection - cleaning up');
-          this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
-          this.client?.ws?.close();
-          this.client.end(new Error('Close connection'));
+          this.logger.error('Max reconnection attempts reached. Marking as disconnected.');
+        }
+      } else {
+        // Explicit logout or forbidden
+        this.logger.info('Permanent disconnection or logout - cleaning up session');
+        this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
+
+        // Cleanup
+        if (this.client?.ws) {
+          try {
+            this.client.ws.close();
+          } catch (e) { }
         }
       }
+    }
 
-      // ═══════════════════════════════════════════════════════════
-      // CONNECTION OPEN - SIMPLIFIED
-      // ═══════════════════════════════════════════════════════════
-      else if ((connection as string) === 'open') {
-        this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
+    // ═══════════════════════════════════════════════════════════
+    // CONNECTION OPEN - SIMPLIFIED
+    // ═══════════════════════════════════════════════════════════
+    else if ((connection as string) === 'open') {
+      this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
+      this.logger.info(`✅ CONNECTED TO WHATSAPP - ${this.instance.name} (${this.instance.wuid})`);
 
-        // Get profile picture (non-blocking)
-        this.profilePicture(this.instance.wuid)
-          .then(pic => this.instance.profilePictureUrl = pic.profilePictureUrl)
-          .catch(() => this.instance.profilePictureUrl = null);
-
-        this.logger.info(`✅ CONNECTED TO WHATSAPP - ${this.instance.name} (${this.instance.wuid})`);
-
-        // Reset QR code and session flags
-        this.instance.qrcode.count = 0;
-        this.instance.qrcode.base64 = null;
-        this.instance.qrcode.code = null;
-        this.instance.qrcode.pairingCode = null;
-        this.endSession = false;
-        this.reconnectAttempts = 0;
-
-        // Reset proxy failure tracking on successful connection
-        this.proxyConnectionFailures = 0;
-        if (this.proxyDisabledDueToFailure) {
-          this.logger.info('Connection succeeded without proxy - proxy remains disabled for this session');
-        }
-
-        // Update connection status (WITH await to prevent race conditions)
-        const profileName = await this.getProfileName();
-        await this.updateConnectionStatus('open', {
-          ownerJid: this.instance.wuid,
-          profileName: profileName as string,
-          profilePicUrl: this.instance.profilePictureUrl,
-        });
-
-        // Send webhooks (non-blocking)
-        this.sendDataWebhook(Events.CONNECTION_UPDATE, {
-          instance: this.instance.name,
-          state: 'open',
-          wuid: this.instance.wuid,
-        });
-
-        // Sync Chatwoot lost messages (non-blocking)
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-          this.syncChatwootLostMessages();
-        }
-
-        // Mark client as ready (with delay for stability)
-        if (this.clientReadyTimeout) {
-          clearTimeout(this.clientReadyTimeout);
-        }
-        this.clientReadyTimeout = setTimeout(() => {
-          this.isClientReady = true;
-          this.logger.info('Client ready for operations');
-          this.clientReadyTimeout = null;
-        }, 3000); // 3s delay
+      // Reset counters
+      this.reconnectAttempts = 0;
+      this.endSession = false;
+      if (this.reconnectTimeout) {
+        clearTimeout(this.reconnectTimeout);
+        this.reconnectTimeout = null;
       }
 
-      // ═══════════════════════════════════════════════════════════
-      // CONNECTION CONNECTING
-      // ═══════════════════════════════════════════════════════════
-      else if ((connection as string) === 'connecting') {
-        if (this.stateConnection.state !== 'connecting') {
-          await this.updateConnectionStatus('connecting');
-        }
+      // Reset QR code
+      this.instance.qrcode.count = 0;
+      this.instance.qrcode.base64 = null;
+
+      // Get profile picture (non-blocking background task)
+      this.profilePicture(this.instance.wuid)
+        .then(pic => this.instance.profilePictureUrl = pic.profilePictureUrl)
+        .catch(() => { });
+
+      // Update status in DB with owner info
+      const profileName = await this.getProfileName();
+      await this.updateConnectionStatus('open', {
+        ownerJid: this.instance.wuid,
+        profileName: profileName as string,
+      });
+
+      // Send webhooks (background)
+      this.sendDataWebhook(Events.CONNECTION_UPDATE, {
+        instance: this.instance.name,
+        state: 'open',
+        wuid: this.instance.wuid,
+      });
+
+      // Mark ready after a short delay to allow background processing to settle
+      setTimeout(() => {
+        this.isClientReady = true;
+        this.logger.info('Client ready for operations');
+      }, 1000);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // CONNECTION CONNECTING
+    // ═══════════════════════════════════════════════════════════
+    else if ((connection as string) === 'connecting') {
+      if (this.stateConnection.state !== 'connecting') {
+        await this.updateConnectionStatus('connecting');
       }
     }
   }
 
-  private async getMessage(key: proto.IMessageKey, full = false) {
+  private async getMessage(key: WAMessageKey, full = false) {
+    // CRITICAL FIX: Add defensive check for null key OR missing id
+    if (!key || !key.id) {
+      this.logger.warn(`[getMessage] Invalid key provided (key: ${JSON.stringify(key)})`);
+      return full ? null : { conversation: '' };
+    }
+
     try {
       const webMessageInfo = (await this.prismaRepository.message.findMany({
-        where: { instanceId: this.instanceId, key: { path: ['id'], equals: key.id } },
+        where: { instanceId: this.instance.id, key: { path: ['id'], equals: key.id } },
       })) as unknown as proto.IWebMessageInfo[];
 
       // CRITICAL FIX: Check if message exists to prevent undefined errors
@@ -1680,14 +1663,15 @@ export class BaileysStartupService extends ChannelStartupService {
     // Setup WebSocket event listeners with error handling
     this.setupWebSocketListeners();
 
-    // Start background settings cache refresh (critical for high-volume)
-    await this.startSettingsCacheRefresh();
-
-    // Start background stream health check (prevents message loss)
-    this.startStreamHealthCheck();
-
-    // Start periodic cache cleanup (prevents memory leaks)
-    this.startCacheCleanup();
+    // CRITICAL FIX: Make startup tasks NON-BLOCKING
+    // This prevents slow DB queries from timing out the Baileys handshake
+    setImmediate(() => {
+      this.startSettingsCacheRefresh().catch(e => {
+        this.logger.error(`Error in settings cache refresh: ${e.message}`);
+      });
+      this.startStreamHealthCheck();
+      this.startCacheCleanup();
+    });
 
     this.phoneNumber = number;
 
@@ -1801,7 +1785,7 @@ export class BaileysStartupService extends ChannelStartupService {
       await this.resolveLIDsInChat(chats);
 
       const existingChatIds = await this.prismaRepository.chat.findMany({
-        where: { instanceId: this.instanceId },
+        where: { instanceId: this.instance.id },
         select: { remoteJid: true },
       });
 
@@ -1811,7 +1795,7 @@ export class BaileysStartupService extends ChannelStartupService {
         .filter((chat) => !existingChatIdSet?.has(chat.id))
         .map((chat) => ({
           remoteJid: chat.id,
-          instanceId: this.instanceId,
+          instanceId: this.instance.id,
           name: chat.name,
           unreadMessages: chat.unreadCount !== undefined ? chat.unreadCount : 0,
         }));
@@ -1835,7 +1819,7 @@ export class BaileysStartupService extends ChannelStartupService {
       await this.resolveLIDsInChat(chats as Chat[]);
 
       const chatsRaw = chats.map((chat) => {
-        return { remoteJid: chat.id, instanceId: this.instanceId };
+        return { remoteJid: chat.id, instanceId: this.instance.id };
       });
 
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
@@ -1843,7 +1827,7 @@ export class BaileysStartupService extends ChannelStartupService {
       for (const chat of chats) {
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
           await this.prismaRepository.chat.updateMany({
-            where: { instanceId: this.instanceId, remoteJid: chat.id },
+            where: { instanceId: this.instance.id, remoteJid: chat.id },
             data: { remoteJid: chat.id, name: chat.name },
           });
         }
@@ -1853,7 +1837,7 @@ export class BaileysStartupService extends ChannelStartupService {
     'chats.delete': async (chats: string[]) => {
       if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
         await this.prismaRepository.chat.deleteMany({
-          where: { instanceId: this.instanceId, remoteJid: { in: chats } },
+          where: { instanceId: this.instance.id, remoteJid: { in: chats } },
         });
       }
     },
@@ -1866,16 +1850,11 @@ export class BaileysStartupService extends ChannelStartupService {
         await Promise.all(contacts.map((contact) => this.resolveLIDsInContact(contact)));
 
         const contactsRaw: any = contacts.map((contact) => {
-          // v7: Extrair phone number do contact.phoneNumber ou contact.id
-          const phoneNumber =
-            contact.phoneNumber || (contact.id?.includes('@s.whatsapp.net') ? contact.id.split('@')[0] : null);
-
           return {
             remoteJid: contact.id,
-            phoneNumber: phoneNumber,
             pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
             profilePicUrl: null,
-            instanceId: this.instanceId,
+            instanceId: this.instance.id,
           };
         });
 
@@ -1912,7 +1891,7 @@ export class BaileysStartupService extends ChannelStartupService {
             remoteJid: contact.id,
             pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
             profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
-            instanceId: this.instanceId,
+            instanceId: this.instance.id,
           })),
         );
 
@@ -1926,7 +1905,7 @@ export class BaileysStartupService extends ChannelStartupService {
           await Promise.all(
             updatedContacts.map(async (contact) => {
               const update = this.prismaRepository.contact.updateMany({
-                where: { remoteJid: contact.remoteJid, instanceId: this.instanceId },
+                where: { remoteJid: contact.remoteJid, instanceId: this.instance.id },
                 data: { profilePicUrl: contact.profilePicUrl },
               });
 
@@ -1968,7 +1947,7 @@ export class BaileysStartupService extends ChannelStartupService {
           remoteJid: contact.id!,
           pushName: contact?.name ?? contact?.verifiedName,
           profilePicUrl: (await this.profilePicture(contact.id!)).profilePictureUrl,
-          instanceId: this.instanceId,
+          instanceId: this.instance.id,
         });
       }
 
@@ -2026,7 +2005,7 @@ export class BaileysStartupService extends ChannelStartupService {
         if (chats.length > 0) {
           const existingChatIds = new Set(
             (await this.prismaRepository.chat.findMany({
-              where: { instanceId: this.instanceId },
+              where: { instanceId: this.instance.id },
               select: { remoteJid: true }
             })).map(chat => chat.remoteJid)
           );
@@ -2035,7 +2014,7 @@ export class BaileysStartupService extends ChannelStartupService {
             .filter(chat => !existingChatIds.has(chat.id))
             .map(chat => ({
               remoteJid: chat.id,
-              instanceId: this.instanceId,
+              instanceId: this.instance.id,
               name: chat.name
             }));
 
@@ -2052,7 +2031,7 @@ export class BaileysStartupService extends ChannelStartupService {
         // Cache existing messages to avoid duplicates
         const existingMessageIds = new Set(
           (await this.prismaRepository.message.findMany({
-            where: { instanceId: this.instanceId },
+            where: { instanceId: this.instance.id },
             select: { key: true }
           })).map(m => (m.key as any).id)
         );
@@ -2277,7 +2256,7 @@ export class BaileysStartupService extends ChannelStartupService {
                   keyId: editedMessage.key.id,
                   remoteJid: editedMessage.key.remoteJid,
                   status: 'EDITED',
-                  instanceId: this.instanceId,
+                  instanceId: this.instance.id,
                   messageId: (oldMessage as any).id,
                 },
               });
@@ -2301,7 +2280,7 @@ export class BaileysStartupService extends ChannelStartupService {
           const normalizedRemoteJid = this.normalizeRemoteJid(received.key) || received.key.remoteJid!;
 
           const existingChat = await this.prismaRepository.chat.findFirst({
-            where: { instanceId: this.instanceId, remoteJid: normalizedRemoteJid },
+            where: { instanceId: this.instance.id, remoteJid: normalizedRemoteJid },
             select: { id: true, name: true },
           });
 
@@ -2358,7 +2337,7 @@ export class BaileysStartupService extends ChannelStartupService {
           ) {
             const chatwootSentMessage = await this.chatwootService.eventWhatsapp(
               Events.MESSAGES_UPSERT,
-              { instanceName: this.instance.name, instanceId: this.instanceId },
+              { instanceName: this.instance.name, instanceId: this.instance.id },
               messageRaw,
             );
 
@@ -2371,7 +2350,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
           if (this.configService.get<Openai>('OPENAI').ENABLED && received?.message?.audioMessage) {
             const openAiDefaultSettings = await this.prismaRepository.openaiSetting.findFirst({
-              where: { instanceId: this.instanceId },
+              where: { instanceId: this.instance.id },
               include: { OpenaiCreds: true },
             });
 
@@ -2389,7 +2368,7 @@ export class BaileysStartupService extends ChannelStartupService {
                 this.logger.verbose(`Message ${messageRaw.key.id} already exists in DB, skipping create`);
                 // Use existing message for status updates below
                 msg = await this.prismaRepository.message.findFirst({
-                  where: { instanceId: this.instanceId, key: { path: ['id'], equals: messageRaw.key.id } }
+                  where: { instanceId: this.instance.id, key: { path: ['id'], equals: messageRaw.key.id } }
                 });
               } else {
                 throw err;
@@ -2441,7 +2420,7 @@ export class BaileysStartupService extends ChannelStartupService {
                       await this.prismaRepository.media.create({
                         data: {
                           messageId: msg.id,
-                          instanceId: this.instanceId,
+                          instanceId: this.instance.id,
                           type: mediaType,
                           fileName: fullName,
                           mimetype,
@@ -2497,7 +2476,7 @@ export class BaileysStartupService extends ChannelStartupService {
             this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
             await chatbotController.emit({
-              instance: { instanceName: this.instance.name, instanceId: this.instanceId },
+              instance: { instanceName: this.instance.name, instanceId: this.instance.id },
               remoteJid: messageRaw.key.remoteJid,
               msg: messageRaw,
               pushName: messageRaw.pushName,
@@ -2507,7 +2486,7 @@ export class BaileysStartupService extends ChannelStartupService {
             const normalizedContactJid = this.normalizeRemoteJid(received.key) || received.key.remoteJid;
 
             const contact = await this.prismaRepository.contact.findFirst({
-              where: { remoteJid: normalizedContactJid, instanceId: this.instanceId },
+              where: { remoteJid: normalizedContactJid, instanceId: this.instance.id },
             });
 
             // Skip profile picture fetch during synchronization (append/historic) for performance
@@ -2517,7 +2496,7 @@ export class BaileysStartupService extends ChannelStartupService {
               remoteJid: normalizedContactJid,
               pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
               profilePicUrl: shouldFetchPP ? (await this.profilePicture(normalizedContactJid)).profilePictureUrl : undefined,
-              instanceId: this.instanceId,
+              instanceId: this.instance.id,
             };
 
             if (contactRaw.remoteJid === 'status@broadcast') {
@@ -2581,8 +2560,8 @@ export class BaileysStartupService extends ChannelStartupService {
                   pushName: msg.pushName || 'Unknown',
                   message: msg.message || {},
                   messageType: Object.keys(msg.message || {})[0] || 'unknown',
-                  messageTimestamp: msg.messageTimestamp || Date.now(),
-                  instanceId: this.instanceId,
+                  messageTimestamp: Number(msg.messageTimestamp || Math.floor(Date.now() / 1000)),
+                  instanceId: this.instance.id,
                   source: 'FAILSAFE',
                 };
 
@@ -2695,7 +2674,7 @@ export class BaileysStartupService extends ChannelStartupService {
           if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
             this.chatwootService.eventWhatsapp(
               'messages.read',
-              { instanceName: this.instance.name, instanceId: this.instanceId },
+              { instanceName: this.instance.name, instanceId: this.instance.id },
               { key: key },
             );
           }
@@ -2728,14 +2707,14 @@ export class BaileysStartupService extends ChannelStartupService {
             participant: key?.participant,
             status: status[update.status] ?? 'DELETED',
             pollUpdates,
-            instanceId: this.instanceId,
+            instanceId: this.instance.id,
           };
 
           let findMessage: any;
           const configDatabaseData = this.configService.get<Database>('DATABASE').SAVE_DATA;
           if (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE) {
             findMessage = await this.prismaRepository.message.findFirst({
-              where: { instanceId: this.instanceId, key: { path: ['id'], equals: key.id } },
+              where: { instanceId: this.instance.id, key: { path: ['id'], equals: key.id } },
             });
 
             if (findMessage) message.messageId = findMessage.id;
@@ -2758,7 +2737,7 @@ export class BaileysStartupService extends ChannelStartupService {
             if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
               this.chatwootService.eventWhatsapp(
                 Events.MESSAGES_DELETE,
-                { instanceName: this.instance.name, instanceId: this.instanceId },
+                { instanceName: this.instance.name, instanceId: this.instance.id },
                 { key: key },
               );
             }
@@ -2799,11 +2778,11 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           const existingChat = await this.prismaRepository.chat.findFirst({
-            where: { instanceId: this.instanceId, remoteJid: message.remoteJid },
+            where: { instanceId: this.instance.id, remoteJid: message.remoteJid },
           });
 
           if (existingChat) {
-            const chatToInsert = { remoteJid: message.remoteJid, instanceId: this.instanceId, unreadMessages: 0 };
+            const chatToInsert = { remoteJid: message.remoteJid, instanceId: this.instance.id, unreadMessages: 0 };
 
             this.sendDataWebhook(Events.CHATS_UPSERT, [chatToInsert]);
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS) {
@@ -2851,12 +2830,12 @@ export class BaileysStartupService extends ChannelStartupService {
     [Events.LABELS_EDIT]: async (label: Label) => {
       this.sendDataWebhook(Events.LABELS_EDIT, { ...label, instance: this.instance.name });
 
-      const labelsRepository = await this.prismaRepository.label.findMany({ where: { instanceId: this.instanceId } });
+      const labelsRepository = await this.prismaRepository.label.findMany({ where: { instanceId: this.instance.id } });
 
       const savedLabel = labelsRepository.find((l) => l.labelId === label.id);
       if (label.deleted && savedLabel) {
         await this.prismaRepository.label.delete({
-          where: { labelId_instanceId: { instanceId: this.instanceId, labelId: label.id } },
+          where: { labelId_instanceId: { instanceId: this.instance.id, labelId: label.id } },
         });
         this.sendDataWebhook(Events.LABELS_EDIT, { ...label, instance: this.instance.name });
         return;
@@ -2870,7 +2849,7 @@ export class BaileysStartupService extends ChannelStartupService {
             name: labelName,
             labelId: label.id,
             predefinedId: label.predefinedId,
-            instanceId: this.instanceId,
+            instanceId: this.instance.id,
           };
           await this.prismaRepository.label.upsert({
             where: { labelId_instanceId: { instanceId: labelData.instanceId, labelId: labelData.labelId } },
@@ -3312,7 +3291,7 @@ export class BaileysStartupService extends ChannelStartupService {
       let jidList;
       if (message['status'].option.allContacts) {
         const contacts = await this.prismaRepository.contact.findMany({
-          where: { instanceId: this.instanceId, remoteJid: { not: { endsWith: '@g.us' } } },
+          where: { instanceId: this.instance.id, remoteJid: { not: { endsWith: '@g.us' } } },
         });
 
         jidList = contacts.map((contact) => contact.remoteJid);
@@ -3510,14 +3489,14 @@ export class BaileysStartupService extends ChannelStartupService {
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled && !isIntegration) {
         this.chatwootService.eventWhatsapp(
           Events.SEND_MESSAGE,
-          { instanceName: this.instance.name, instanceId: this.instanceId },
+          { instanceName: this.instance.name, instanceId: this.instance.id },
           messageRaw,
         );
       }
 
       if (this.configService.get<Openai>('OPENAI').ENABLED && messageRaw?.message?.audioMessage) {
         const openAiDefaultSettings = await this.prismaRepository.openaiSetting.findFirst({
-          where: { instanceId: this.instanceId },
+          where: { instanceId: this.instance.id },
           include: { OpenaiCreds: true },
         });
 
@@ -3556,7 +3535,7 @@ export class BaileysStartupService extends ChannelStartupService {
               await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
 
               await this.prismaRepository.media.create({
-                data: { messageId: msg.id, instanceId: this.instanceId, type: mediaType, fileName: fullName, mimetype },
+                data: { messageId: msg.id, instanceId: this.instance.id, type: mediaType, fileName: fullName, mimetype },
               });
 
               const mediaUrl = await s3Service.getObjectUrl(fullName);
@@ -3608,7 +3587,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled && isIntegration) {
         await chatbotController.emit({
-          instance: { instanceName: this.instance.name, instanceId: this.instanceId },
+          instance: { instanceName: this.instance.name, instanceId: this.instance.id },
           remoteJid: messageRaw.key.remoteJid,
           msg: messageRaw,
           pushName: messageRaw.pushName,
@@ -3745,7 +3724,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (status.allContacts) {
-      const contacts = await this.prismaRepository.contact.findMany({ where: { instanceId: this.instanceId } });
+      const contacts = await this.prismaRepository.contact.findMany({ where: { instanceId: this.instance.id } });
 
       if (!contacts.length) {
         throw new BadRequestException('Contacts not found');
@@ -4806,7 +4785,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // USERS
     const contacts: any[] = await this.prismaRepository.contact.findMany({
-      where: { instanceId: this.instanceId, remoteJid: { in: jids.users.map(({ jid }) => jid) } },
+      where: { instanceId: this.instance.id, remoteJid: { in: jids.users.map(({ jid }) => jid) } },
     });
 
     // Separate @lid numbers from normal numbers
@@ -4969,7 +4948,7 @@ export class BaileysStartupService extends ChannelStartupService {
   public async getLastMessage(number: string) {
     const messages = await this.prismaRepository.message.findMany({
       where: {
-        instanceId: this.instanceId,
+        instanceId: this.instance.id,
         key: { path: ['remoteJid'], equals: number },
       },
       orderBy: { messageTimestamp: 'desc' },
@@ -4994,7 +4973,7 @@ export class BaileysStartupService extends ChannelStartupService {
         last_message = await this.getLastMessage(number);
       } else {
         last_message = data.lastMessage;
-        last_message.messageTimestamp = last_message?.messageTimestamp ?? Date.now();
+        last_message.messageTimestamp = last_message?.messageTimestamp ?? Math.floor(Date.now() / 1000);
         number = last_message?.key?.remoteJid;
       }
 
@@ -5022,7 +5001,7 @@ export class BaileysStartupService extends ChannelStartupService {
         last_message = await this.getLastMessage(number);
       } else {
         last_message = data.lastMessage;
-        last_message.messageTimestamp = last_message?.messageTimestamp ?? Date.now();
+        last_message.messageTimestamp = last_message?.messageTimestamp ?? Math.floor(Date.now() / 1000);
         number = last_message?.key?.remoteJid;
       }
 
@@ -5066,7 +5045,7 @@ export class BaileysStartupService extends ChannelStartupService {
                 fromMe: response.key.fromMe,
                 participant: response.key?.remoteJid,
                 status: 'DELETED',
-                instanceId: this.instanceId,
+                instanceId: this.instance.id,
               };
               await this.prismaRepository.messageUpdate.create({ data: messageUpdate });
             }
@@ -5618,7 +5597,7 @@ export class BaileysStartupService extends ChannelStartupService {
     if (source === 'database' || source === 'all') {
       try {
         const dbChats = await this.prismaRepository.chat.findMany({
-          where: { instanceId: this.instanceId },
+          where: { instanceId: this.instance.id },
           select: { remoteJid: true },
           orderBy: { updatedAt: 'desc' },
           take: maxChats,
@@ -5692,7 +5671,7 @@ export class BaileysStartupService extends ChannelStartupService {
       if (chats.length < maxChats) {
         try {
           const contacts = await this.prismaRepository.contact.findMany({
-            where: { instanceId: this.instanceId },
+            where: { instanceId: this.instance.id },
             select: { remoteJid: true },
             orderBy: { updatedAt: 'desc' },
             take: maxChats - chats.length,
@@ -5887,7 +5866,7 @@ export class BaileysStartupService extends ChannelStartupService {
       // Get ALL chats from database - NO LIMIT!
       const allChats = await this.prismaRepository.chat.findMany({
         where: {
-          instanceId: this.instanceId,
+          instanceId: this.instance.id,
         },
         select: {
           remoteJid: true,
@@ -6070,7 +6049,7 @@ export class BaileysStartupService extends ChannelStartupService {
                 fromMe: messageSent.key.fromMe,
                 participant: messageSent.key?.remoteJid,
                 status: 'EDITED',
-                instanceId: this.instanceId,
+                instanceId: this.instance.id,
               };
               await this.prismaRepository.messageUpdate.create({ data: messageUpdate });
             }
@@ -6086,7 +6065,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async fetchLabels(): Promise<LabelDto[]> {
-    const labels = await this.prismaRepository.label.findMany({ where: { instanceId: this.instanceId } });
+    const labels = await this.prismaRepository.label.findMany({ where: { instanceId: this.instance.id } });
 
     return labels.map((label) => ({
       color: label.color,
@@ -6383,7 +6362,7 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       const participants = (await this.client.groupMetadata(id.groupJid)).participants;
       const contacts = await this.prismaRepository.contact.findMany({
-        where: { instanceId: this.instanceId, remoteJid: { in: participants.map((p) => p.id) } },
+        where: { instanceId: this.instance.id, remoteJid: { in: participants.map((p) => p.id) } },
       });
       const parsedParticipants = participants.map((participant) => {
         const contact = contacts.find((c) => c.remoteJid === participant.id);
@@ -6695,8 +6674,8 @@ export class BaileysStartupService extends ChannelStartupService {
       message: { ...message.message },
       contextInfo: contentMsg?.contextInfo,
       messageType: contentType || 'unknown',
-      messageTimestamp: message.messageTimestamp as number,
-      instanceId: this.instanceId,
+      messageTimestamp: Number(message.messageTimestamp),
+      instanceId: this.instance.id,
       source: getDevice(message.key.id),
     };
 
@@ -6777,13 +6756,13 @@ export class BaileysStartupService extends ChannelStartupService {
         this.prismaRepository.chat.findFirst({
           where: {
             remoteJid,
-            instanceId: this.instanceId
+            instanceId: this.instance.id
           }
         }),
         this.prismaRepository.message.count({
           where: {
             AND: [
-              { instanceId: this.instanceId },
+              { instanceId: this.instance.id },
               { key: { path: ['remoteJid'], equals: remoteJid } },
               { key: { path: ['fromMe'], equals: false } },
               { status: { equals: status[3] } },
@@ -7153,7 +7132,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const count = await this.prismaRepository.message.count({
       where: {
-        instanceId: this.instanceId,
+        instanceId: this.instance.id,
         id: query?.where?.id,
         source: query?.where?.source,
         messageType: query?.where?.messageType,
@@ -7177,7 +7156,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const messages = await this.prismaRepository.message.findMany({
       where: {
-        instanceId: this.instanceId,
+        instanceId: this.instance.id,
         id: query?.where?.id,
         source: query?.where?.source,
         messageType: query?.where?.messageType,
